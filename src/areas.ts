@@ -1,9 +1,11 @@
+import { nameMatches } from './fold';
 import type { PotokPlace, PotokPlaceShape } from './potok';
 
 // Areas among the map's places (`shape: "area"`), as Potok's own map shows
-// them: every area is a layer of its own, whatever the kind chips say, drawn
-// as a border with its pin once it is wide enough on the screen, and a pin
-// among the others before that. Kept free of the DOM (areas.test.ts).
+// them: an area is only the shape of its group, which the kind chips and the
+// search keep or leave out like any place, drawn as a border with its pin
+// once it is wide enough on the screen, and a pin among the others before
+// that. Kept free of the DOM (areas.test.ts).
 
 export type Geo = PotokPlaceShape['geojson'];
 export type Layers = { places: boolean; areas: boolean };
@@ -33,30 +35,56 @@ export function isDrawn(place: PotokPlace, zoom: number): boolean {
   return place.shape === 'area' && spanPx(place, zoom) >= DRAWN_PX;
 }
 
-export type ShownOptions = { layers: Layers; kind: string | null; inside: number | null; zoom: number };
+export type ShownOptions = {
+  layers: Layers;
+  kind: string | null;
+  inside: number | null;
+  zoom: number;
+  search?: string;
+};
 
 /**
- * What the map shows at `zoom`. `borders`: the areas drawn as borders, the
- * biggest first so that smaller ones lie on top, each with its own pin.
- * `pins`: what gathers into clusters, the places by the kind chips and the
- * areas too small to draw whatever the chips, or with areas off every place
- * by the chips. `inside` keeps only the pins inside that area.
+ * The places the kind chip, the search and "only inside" keep, areas as much
+ * as points: `inside` keeps the places inside that area, not the area itself.
+ * With places off, only the areas.
+ */
+export function kept(places: PotokPlace[], options: Omit<ShownOptions, 'zoom'>): PotokPlace[] {
+  const { layers, kind, inside, search = '' } = options;
+
+  return places.filter(
+    (place) =>
+      (inside === null || (place.id !== inside && place.areas.includes(inside))) &&
+      (kind === null || place.kind === kind) &&
+      (layers.places || place.shape === 'area') &&
+      nameMatches(place.name, search),
+  );
+}
+
+/**
+ * What the map shows at `zoom`, out of the places kept (`kept`). `borders`:
+ * the areas drawn as borders, the biggest first so that smaller ones lie on
+ * top, each with its own pin. `pins`: what gathers into clusters, the rest,
+ * or with areas off every place.
  */
 export function shown(places: PotokPlace[], options: ShownOptions): { borders: PotokPlace[]; pins: PotokPlace[] } {
-  const { layers, kind, inside, zoom } = options;
-  const within = (place: PotokPlace) => inside === null || (place.id !== inside && place.areas.includes(inside));
+  const keep = kept(places, options);
+  const drawn = (place: PotokPlace) => options.layers.areas && isDrawn(place, options.zoom);
 
-  const borders = layers.areas
-    ? places.filter((place) => isDrawn(place, zoom)).sort((a, b) => boxSize(b) - boxSize(a))
-    : [];
+  return {
+    borders: keep.filter(drawn).sort((a, b) => boxSize(b) - boxSize(a)),
+    pins: keep.filter((place) => !drawn(place)),
+  };
+}
 
-  const pins = places.filter((place) => {
-    if (!within(place)) return false;
-    if (layers.areas && place.shape === 'area') return !isDrawn(place, zoom);
-    return layers.places && (kind === null || place.kind === kind);
-  });
-
-  return { borders, pins };
+/** Of `borders`, those reaching into the box `[west, south, east, north]`, at most `limit`. */
+export function inBox(borders: PotokPlace[], [west, south, east, north]: number[], limit: number): PotokPlace[] {
+  return borders
+    .filter((place) => {
+      if (!place.bbox) return false;
+      const [w, s, e, n] = place.bbox;
+      return w <= east && e >= west && s <= north && n >= south;
+    })
+    .slice(0, limit);
 }
 
 function boxSize(place: PotokPlace): number {

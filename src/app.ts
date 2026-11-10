@@ -1,7 +1,7 @@
 import * as L from 'leaflet';
 import { html, nothing, render, type TemplateResult } from 'lit-html';
 import { unsafeSVG } from 'lit-html/directives/unsafe-svg.js';
-import { areasAt, LEVELS, levelFor, outerRings, shown, toLatLngs, type Geo, type Layers } from './areas';
+import { areasAt, inBox, kept, LEVELS, levelFor, outerRings, shown, toLatLngs, type Geo, type Layers } from './areas';
 import { translator, type Translate } from './i18n';
 import { icon, type IconName } from './icons';
 import { clusterHtml, pinSvg } from './pins';
@@ -26,11 +26,13 @@ import type { PotokConfig, PotokMapConfig, PotokPlace } from './potok';
 // own app works with that group's rights. Whoever may make sub-groups here
 // adds a place where the map's middle is.
 //
-// Areas among them (`shape: "area"`) are a layer of their own, as on Potok's
-// map: a border with its pin once wide enough, a pin among the others before
-// that, whatever the kind chips say. Their borders come from `placeShapes`
-// once per level of detail and stay here. A tap on the map off the pins
-// shows the areas there, and "only inside" keeps the pins of one area.
+// An area among them (`shape: "area"`) is only the shape of its group, as on
+// Potok's map: the kind chips and the search keep it or leave it out like any
+// place; it is a border with its pin once wide enough, a pin among the others
+// before that. Borders come from `placeShapes` once per level of detail, for
+// the part of the map in view, and stay here. A tap on the map off the pins
+// shows the areas there, and "only inside" keeps the places of one area,
+// which stays outlined.
 //
 // Leaflet draws the map and the pins; lit-html draws what floats over it.
 
@@ -58,6 +60,7 @@ type State = {
   layerMenu: boolean;
   inside: number | null;
   here: Here | null;
+  search: string;
 };
 
 const PLACE_ZOOM = 16;
@@ -69,6 +72,10 @@ const REFRESH_SPREAD_MS = 2000;
 // A tap waits this long, so that a double tap zooms instead.
 const TAP_DELAY_MS = 250;
 const SHAPES_PER_CALL = 100;
+// Borders a view draws at most, the biggest first, as on Potok's map.
+const MAX_BORDERS = 300;
+// How long a move to a place or an area takes, in seconds, as on Potok's map.
+const FLY_SECONDS = 0.5;
 // An area's pin stands over the other pins.
 const AREA_PIN_Z = 500;
 // The whole world, around the holes of the area "only inside" keeps.
@@ -106,6 +113,7 @@ export function mountMap(root: HTMLElement) {
     layerMenu: false,
     inside: null,
     here: null,
+    search: '',
   };
 
   let map: L.Map | null = null;
@@ -121,6 +129,10 @@ export function mountMap(root: HTMLElement) {
   let borders: PotokPlace[] = [];
   let pinned: PotokPlace[] = [];
   let shownKey = '';
+  // The markers of pins and the borders drawn, by place, so a pick only
+  // changes their look.
+  const pinMarkers = new Map<number, L.Marker>();
+  const areaPaths = new Map<number, L.Polygon>();
   // Borders by `id:v:level`, and those on their way.
   const shapes = new Map<string, Geo>();
   const pendingShapes = new Set<string>();
@@ -204,11 +216,11 @@ export function mountMap(root: HTMLElement) {
       zoomControl: false,
       worldCopyJump: true,
       maxZoom: config.tiles.max_zoom,
-      minZoom: 3,
+      minZoom: 2,
     });
 
     map.attributionControl.setPrefix('<a href="https://leafletjs.com" target="_blank" rel="noopener">Leaflet</a>');
-    L.control.zoom({ position: 'bottomleft' }).addTo(map);
+    L.control.zoom({ position: 'bottomright' }).addTo(map);
     L.tileLayer(config.tiles.url, { maxZoom: config.tiles.max_zoom, attribution: config.tiles.attribution }).addTo(map);
 
     // Areas under the pins, the dimming around the one "only inside" keeps
@@ -236,7 +248,8 @@ export function mountMap(root: HTMLElement) {
 
     map.on('moveend', () => {
       // A zoom can turn an area from a pin into a border and back.
-      if (shownSignature() !== shownKey) rebuild();
+      const current = shown(state.places, shownOptions());
+      if (signature(current) !== shownKey) rebuild(current);
       else drawMarkers();
 
       drawAreas();
@@ -262,24 +275,24 @@ export function mountMap(root: HTMLElement) {
     kind: state.kind,
     inside: state.inside,
     zoom: Math.round(map?.getZoom() ?? 0),
+    search: state.search,
   });
 
-  const shownSignature = () => {
-    const { borders: drawn, pins: rest } = shown(state.places, shownOptions());
-    return `${drawn.map((place) => place.id).join(',')}|${rest.length}`;
-  };
+  const signature = (current: { borders: PotokPlace[]; pins: PotokPlace[] }) =>
+    `${current.borders.map((place) => place.id).join(',')}|${current.pins.map((place) => place.id).join(',')}`;
 
-  const rebuild = () => {
+  const rebuild = (given?: { borders: PotokPlace[]; pins: PotokPlace[] }) => {
     byId.clear();
     state.places.forEach((place) => byId.set(place.id, place));
 
     const kind = state.kind !== null && state.places.some((place) => place.kind === state.kind) ? state.kind : null;
+    const changed = kind !== state.kind;
     state = { ...state, kind };
 
-    const current = shown(state.places, shownOptions());
+    const current = given && !changed ? given : shown(state.places, shownOptions());
     borders = current.borders;
     pinned = current.pins;
-    shownKey = shownSignature();
+    shownKey = signature(current);
 
     index = buildIndex(pinned, pins(), map?.getMaxZoom() ?? 19);
     drawMarkers();
@@ -305,12 +318,24 @@ export function mountMap(root: HTMLElement) {
     return null;
   };
 
+  // The borders in view, the biggest first, at most `MAX_BORDERS`.
+  const bordersInView = (): PotokPlace[] => {
+    if (!map) return [];
+    const box = map.getBounds();
+    return inBox(borders, [box.getWest(), box.getSouth(), box.getEast(), box.getNorth()], MAX_BORDERS);
+  };
+
+  // The area "only inside" keeps, outlined whatever the zoom and the filters.
+  const insideArea = (): PotokPlace | undefined =>
+    state.inside === null ? undefined : byId.get(state.inside);
+
   const fetchShapes = () => {
-    if (!map || borders.length === 0) return;
+    const wanted = [...bordersInView(), ...(insideArea()?.bbox ? [insideArea()!] : [])];
+    if (!map || wanted.length === 0) return;
 
     const zoom = Math.round(map.getZoom());
     const level = levelFor(zoom);
-    const missing = borders.filter((place) => {
+    const missing = wanted.filter((place) => {
       const key = shapeKey(place, level);
       return !shapes.has(key) && !pendingShapes.has(key);
     });
@@ -342,11 +367,13 @@ export function mountMap(root: HTMLElement) {
     maskLayer.clearLayers();
     chosenLayer.clearLayers();
     borderPins.clearLayers();
+    areaPaths.clear();
+    for (const place of borders) pinMarkers.delete(place.id);
 
     const view = map.getBounds();
     const holes: [number, number][][] = [];
 
-    for (const place of borders) {
+    for (const place of bordersInView()) {
       const geo = shapeOf(place);
       const color = lookOf(place, pins()).color;
 
@@ -356,7 +383,7 @@ export function mountMap(root: HTMLElement) {
           west <= view.getWest() && east >= view.getEast() && south <= view.getSouth() && north >= view.getNorth();
         const classes = ['pm-area', covers ? 'is-outline' : '', state.here?.selected === place.id ? 'is-selected' : ''];
 
-        L.polygon(toLatLngs(geo), {
+        const path = L.polygon(toLatLngs(geo), {
           renderer: renderers.areas,
           color,
           fillColor: color,
@@ -364,21 +391,28 @@ export function mountMap(root: HTMLElement) {
           className: classes.filter(Boolean).join(' '),
         }).addTo(areaLayer);
 
-        if (state.inside === place.id) {
-          holes.push(...outerRings(geo));
-
-          L.polygon(toLatLngs(geo), {
-            renderer: renderers.chosen,
-            color,
-            weight: 3,
-            fill: false,
-            interactive: false,
-            className: 'pm-area-chosen',
-          }).addTo(chosenLayer);
-        }
+        areaPaths.set(place.id, path);
       }
 
-      borderPins.addLayer(pinMarker(place, AREA_PIN_Z));
+      const marker = pinMarker(place, AREA_PIN_Z);
+      borderPins.addLayer(marker);
+      pinMarkers.set(place.id, marker);
+    }
+
+    const inside = insideArea();
+    const insideGeo = inside ? shapeOf(inside) : null;
+
+    if (inside && insideGeo) {
+      holes.push(...outerRings(insideGeo));
+
+      L.polygon(toLatLngs(insideGeo), {
+        renderer: renderers.chosen,
+        color: lookOf(inside, pins()).color,
+        weight: 3,
+        fill: false,
+        interactive: false,
+        className: 'pm-area-chosen',
+      }).addTo(chosenLayer);
     }
 
     if (holes.length > 0) {
@@ -395,7 +429,7 @@ export function mountMap(root: HTMLElement) {
   const tapAt = (latlng: L.LatLng) => {
     if (!state.layers.areas || state.adding) return;
 
-    const drawn = borders.flatMap((place) => {
+    const drawn = bordersInView().flatMap((place) => {
       const geo = shapeOf(place);
       return geo ? [{ id: place.id, geo }] : [];
     });
@@ -411,24 +445,42 @@ export function mountMap(root: HTMLElement) {
     if (!state.here) return;
     state = { ...state, here: { ...state.here, selected: id } };
     draw();
-    drawAreas();
+    markAreaSelected();
   };
 
   const closeHere = () => {
     state = { ...state, here: null };
     draw();
-    drawAreas();
+    markAreaSelected();
+  };
+
+  // The border picked on a tap stands out and on top; the rest as they were.
+  const markAreaSelected = () => {
+    for (const [id, path] of areaPaths) {
+      const selected = state.here?.selected === id;
+      path.getElement()?.classList.toggle('is-selected', selected);
+      if (selected) path.bringToFront();
+    }
+  };
+
+  // The pin of the group open on the page stands out and on top.
+  const markSelected = () => {
+    for (const [id, marker] of pinMarkers) {
+      const selected = state.selected === id;
+      marker.getElement()?.classList.toggle('is-selected', selected);
+      marker.setZIndexOffset(selected ? 1000 : byId.get(id)?.shape === 'area' && borders.some((b) => b.id === id) ? AREA_PIN_Z : 0);
+    }
   };
 
   const zoomToArea = (place: PotokPlace) => {
     if (!map || !place.bbox) return;
     const [west, south, east, north] = place.bbox;
-    map.fitBounds(
+    map.flyToBounds(
       [
         [south, west],
         [north, east],
       ],
-      { padding: FIT_PADDING },
+      { padding: FIT_PADDING, duration: FLY_SECONDS },
     );
   };
 
@@ -457,6 +509,7 @@ export function mountMap(root: HTMLElement) {
     const features = index.getClusters([bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()], zoom);
 
     markers.clearLayers();
+    for (const place of pinned) pinMarkers.delete(place.id);
 
     for (const feature of features) {
       const [lng, lat] = feature.geometry.coordinates;
@@ -465,7 +518,7 @@ export function mountMap(root: HTMLElement) {
       if ('cluster' in props && props.cluster) {
         const count = props.point_count;
         const size = clusterSize(count);
-        const label = `${count} ${t('places')}`;
+        const label = t('groupsHere', { n: count });
         const marker = L.marker([lat, lng], {
           icon: L.divIcon({
             html: clusterHtml(count, size, ringGradient(props.tones, pins().tones), label),
@@ -482,7 +535,9 @@ export function mountMap(root: HTMLElement) {
         const place = byId.get(props.id);
         if (!place) continue;
 
-        markers.addLayer(pinMarker(place, 0));
+        const marker = pinMarker(place, 0);
+        markers.addLayer(marker);
+        pinMarkers.set(place.id, marker);
       }
     }
   };
@@ -522,50 +577,53 @@ export function mountMap(root: HTMLElement) {
     if (sameSpot(leaves) || expansion > map.getMaxZoom()) {
       set({ panel: { kind: 'spot', ids: leaves.map((place) => place.id) }, menu: false });
     } else {
-      map.setView([lat, lng], expansion);
+      map.flyTo([lat, lng], expansion, { duration: FLY_SECONDS });
     }
   };
 
   const select = async (place: PotokPlace) => {
     state = { ...state, selected: place.id, menu: false, panel: state.panel?.kind === 'spot' ? null : state.panel };
     draw();
-    drawMarkers();
-    drawAreas();
+    markSelected();
 
     const reply = await potok.showGroup(place.id).catch(() => null);
 
     if (!reply || !reply.ok) {
       state = { ...state, selected: null };
-      drawMarkers();
-      drawAreas();
+      markSelected();
       notify(reply && !reply.ok && reply.error === 'unknown_method' ? t('outdated') : t('openFailed'), true);
       if (reply && !reply.ok && reply.error === 'not_found') void refresh();
     }
   };
 
   const goTo = (place: PotokPlace) => {
-    map?.setView([place.lat, place.lng], Math.max(map.getZoom(), PLACE_ZOOM));
+    map?.flyTo([place.lat, place.lng], Math.max(map.getZoom(), PLACE_ZOOM), { duration: FLY_SECONDS });
     void select(place);
   };
 
-  // Everything that would be shown: borders whole, pins where they stand.
+  // Everything the chips, the search and "only inside" keep: areas whole,
+  // pins where they stand.
   const fitAll = () => {
-    const everything = shown(state.places, { ...shownOptions(), zoom: 0 }).pins;
-    const corners: [number, number][] = [
-      ...everything.map((place) => [place.lat, place.lng] as [number, number]),
-      ...state.places
-        .filter((place) => state.layers.areas && place.bbox)
-        .flatMap((place) => {
-          const [west, south, east, north] = place.bbox!;
-          return [
-            [south, west],
-            [north, east],
-          ] as [number, number][];
-        }),
-    ];
+    const corners: [number, number][] = kept(state.places, shownOptions()).flatMap((place) => {
+      if (state.layers.areas && place.bbox) {
+        const [west, south, east, north] = place.bbox;
+        return [
+          [south, west],
+          [north, east],
+        ] as [number, number][];
+      }
+
+      return [[place.lat, place.lng] as [number, number]];
+    });
 
     if (!map || corners.length === 0) return;
-    map.fitBounds(L.latLngBounds(corners), { padding: FIT_PADDING, maxZoom: PLACE_ZOOM });
+    map.flyToBounds(L.latLngBounds(corners), { padding: FIT_PADDING, maxZoom: PLACE_ZOOM, duration: FLY_SECONDS });
+  };
+
+  const setSearch = (search: string) => {
+    state = { ...state, search, panel: state.panel?.kind === 'spot' ? null : state.panel, here: null };
+    rebuild();
+    draw();
   };
 
   const currentBounds = (): Bounds => {
@@ -712,6 +770,7 @@ export function mountMap(root: HTMLElement) {
 
     return html`
       <div class="pm-top">
+        ${state.places.length > 0 ? searchField() : nothing}
         ${kinds.length > 1 ? kindChips(kinds) : nothing}
         ${insidePlace
           ? html`<div class="pm-chips">
@@ -771,6 +830,19 @@ export function mountMap(root: HTMLElement) {
         : nothing}
     `;
   };
+
+  const searchField = () => html`<label class="pm-search">
+    ${icon('search', 'size-4')}
+    <input
+      id="pm-search"
+      type="search"
+      placeholder=${t('search')}
+      aria-label=${t('search')}
+      autocomplete="off"
+      .value=${state.search}
+      @input=${(event: Event) => setSearch((event.target as HTMLInputElement).value)}
+    />
+  </label>`;
 
   const kindChips = (kinds: { key: string; title: string; count: number }[]) => html`
     <div class="pm-chips" role="toolbar" aria-label=${t('allKinds')}>

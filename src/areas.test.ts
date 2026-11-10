@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { areasAt, contains, isDrawn, levelFor, outerRings, shapeArea, shown, spanPx, type Geo } from './areas';
+import { areasAt, contains, inBox, isDrawn, levelFor, outerRings, shapeArea, shown, spanPx, type Geo } from './areas';
 import type { PotokPlace } from './potok';
 
 const square = (lat: number, lng: number, half: number): [number, number][] => [
@@ -63,13 +63,31 @@ describe('what the map shows', () => {
     expect(pins.map((place) => place.id)).toEqual([1, 2]);
   });
 
-  it('an area too small to draw is a pin, whatever the kind chips or with places off', () => {
+  it('the kind chips and the search keep areas or leave them out like any place', () => {
     const chips = shown(places, { layers, kind: 'polls', inside: null, zoom: 7 });
-    expect(chips.borders.map((place) => place.id)).toEqual([10]);
-    expect(chips.pins.map((place) => place.id)).toEqual([2, 11]);
+    expect(chips.borders).toEqual([]);
+    expect(chips.pins.map((place) => place.id)).toEqual([2]);
 
+    const folders = shown(places, { layers, kind: 'folder', inside: null, zoom: 7 });
+    expect(folders.borders.map((place) => place.id)).toEqual([10]);
+    expect(folders.pins.map((place) => place.id)).toEqual([11]);
+
+    const named = shown(places, { layers, kind: null, inside: null, zoom: 9, search: 'МЕСТО 1' });
+    expect(named.borders.map((place) => place.id)).toEqual([10, 11]);
+    expect(named.pins.map((place) => place.id)).toEqual([1]);
+  });
+
+  it('with places off, only the areas: the small ones as pins', () => {
     const off = shown(places, { layers: { places: false, areas: true }, kind: null, inside: null, zoom: 7 });
+    expect(off.borders.map((place) => place.id)).toEqual([10]);
     expect(off.pins.map((place) => place.id)).toEqual([11]);
+  });
+
+  it('draws only the borders reaching into the view', () => {
+    const { borders } = shown(places, { layers, kind: null, inside: null, zoom: 9 });
+    expect(inBox(borders, [19.0, 45.0, 20.5, 45.5], 300).map((place) => place.id)).toEqual([10, 11]);
+    expect(inBox(borders, [21.0, 44.0, 22.0, 44.5], 300)).toEqual([]);
+    expect(inBox(borders, [19.0, 45.0, 20.5, 45.5], 1).map((place) => place.id)).toEqual([10]);
   });
 
   it('with areas off, every place is a pin by the chips', () => {
@@ -78,9 +96,9 @@ describe('what the map shows', () => {
     expect(pins.map((place) => place.id)).toEqual([1, 2, 11, 10]);
   });
 
-  it('only inside an area: the pins it holds, not the area itself', () => {
+  it('only inside an area: the places it holds, not the area itself', () => {
     const { borders, pins } = shown(places, { layers, kind: null, inside: 10, zoom: 7 });
-    expect(borders.map((place) => place.id)).toEqual([10]);
+    expect(borders).toEqual([]);
     expect(pins.map((place) => place.id)).toEqual([1, 11]);
   });
 });

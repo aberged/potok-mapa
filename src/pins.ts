@@ -52,9 +52,16 @@ export function pinSvg(look: Look, pins: Pins, options: { locked?: boolean; size
   );
 }
 
+/** A cluster's count as it fits on the disc: 1.5k past a thousand, 12k past ten, as on Potok's map. */
+export function clusterText(count: number): string {
+  if (count >= 10_000) return `${Math.floor(count / 1000)}k`;
+  if (count >= 1000) return `${(count / 1000).toFixed(1)}k`;
+  return String(count);
+}
+
 /** A cluster: its count on a disc, in a ring of the tones of its places. */
 export function clusterHtml(count: number, size: number, ring: string, label: string): string {
-  const text = count >= 1000 ? `${Math.floor(count / 1000)}k` : String(count);
+  const text = clusterText(count);
 
   return (
     `<div class="pm-cluster" style="--pm-size:${size}px;--pm-ring:${escapeAttribute(ring)}" role="img" aria-label="${escapeAttribute(label)}">` +

@@ -129,10 +129,10 @@ describe('the places shown', () => {
 describe('the words', () => {
   it('every language has every word, and fills in numbers', () => {
     expect(keys.en).toEqual(keys.sr);
-    expect(translator('sr')('truncated', { n: 2000 })).toBe('Prikazano je prvih 2000 mesta.');
+    expect(translator('sr')('truncated', { n: 2000 })).toBe('Prikazan je samo deo grupa: 2000.');
     expect(translator('sr-Cyrl')('addPlace')).toBe('Додај место');
     // A name to fill in stays in Latin letters, so Cyrillic fills it in too.
-    expect(translator('sr-Cyrl')('truncated', { n: 2000 })).toBe('Приказано је првих 2000 места.');
+    expect(translator('sr-Cyrl')('truncated', { n: 2000 })).toBe('Приказан је само део група: 2000.');
     expect(translator('sr-Cyrl')('inArea', { n: 'Liman' })).toBe('У: Liman');
     expect(translator('en')('addPlace')).toBe('Add a place');
   });
