@@ -28,6 +28,10 @@ OUTLINE = {
     "map": "map",
     "lock": "lock-closed",
     "home": "home",
+    "layers": "square-3-stack-3d",
+    "area": "viewfinder-circle",
+    "zoomIn": "magnifying-glass-plus",
+    "open": "arrow-top-right-on-square",
 }
 
 # Kept by the bundler as a legal comment, so the build carries it too.

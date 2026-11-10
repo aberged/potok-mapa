@@ -1,4 +1,5 @@
 import './dev-theme.css';
+import { contains, shapeArea, type Geo } from './areas';
 import catalogue from './dev-catalogue.json';
 import type { PotokMapConfig, PotokPlace } from './potok';
 
@@ -7,10 +8,13 @@ import type { PotokMapConfig, PotokPlace } from './potok';
 // `dev-catalogue.json` is what potok-ide's `PinIcons.catalogue/0` gave in
 // Serbian; tiles come straight from OpenStreetMap here, through Potok there.
 // `?lang=en` or `?lang=sr-Cyrl` tries a language, `?viewer=guest` a viewer
-// who may not add places. To start over:
+// who may not add places. Two areas stand in Novi Sad, the city and a quarter,
+// with their borders in `potok-dev:place-shapes` and the areas of every place
+// worked out here, as Potok works them out. To start over:
 // localStorage.removeItem('potok-dev:places').
 
 const PLACES_STORAGE_KEY = 'potok-dev:places';
+const SHAPES_STORAGE_KEY = 'potok-dev:place-shapes';
 const CONFIG_STORAGE_KEY = 'potok-dev:map-config';
 
 type Seed = [name: string, lat: number, lng: number, kind: string, pin?: string | null, closed?: boolean];
@@ -46,7 +50,7 @@ const seeds: Seed[] = [
   ['Ideje za Vranje', 42.5513, 21.9002, 'questionnaire', 'idea'],
 ];
 
-const places: PotokPlace[] = seeds.map(([name, lat, lng, kind, pin = null, closed = false], index) => ({
+const points: PotokPlace[] = seeds.map(([name, lat, lng, kind, pin = null, closed = false], index) => ({
   id: index + 1,
   name,
   lat,
@@ -55,7 +59,70 @@ const places: PotokPlace[] = seeds.map(([name, lat, lng, kind, pin = null, close
   pin,
   picture_url: null,
   is_public: !closed,
+  shape: 'point',
+  areas: [],
 }));
+
+const ring = (corners: [number, number][]): [number, number][] => [...corners, corners[0]];
+
+const areaSeeds: { name: string; pin: string; pinAt: [number, number]; geo: Geo }[] = [
+  {
+    name: 'Grad Novi Sad',
+    pin: 'institution',
+    pinAt: [45.255, 19.845],
+    geo: {
+      type: 'MultiPolygon',
+      coordinates: [
+        [ring([[19.72, 45.21], [19.8, 45.19], [19.93, 45.2], [19.98, 45.25], [19.94, 45.31], [19.82, 45.33], [19.73, 45.29]])],
+      ],
+    },
+  },
+  {
+    name: 'MZ Stari grad',
+    pin: 'association',
+    pinAt: [45.2585, 19.8445],
+    geo: {
+      type: 'MultiPolygon',
+      coordinates: [[ring([[19.835, 45.25], [19.866, 45.25], [19.866, 45.266], [19.835, 45.266]])]],
+    },
+  },
+];
+
+const areaPlaces: PotokPlace[] = areaSeeds.map((area, index) => {
+  const coords = area.geo.coordinates.flat(2);
+  const lngs = coords.map(([lng]) => lng);
+  const lats = coords.map(([, lat]) => lat);
+
+  return {
+    id: 100 + index,
+    name: area.name,
+    lat: area.pinAt[0],
+    lng: area.pinAt[1],
+    kind: 'folder',
+    pin: area.pin,
+    picture_url: null,
+    is_public: true,
+    shape: 'area',
+    areas: [],
+    bbox: [Math.min(...lngs), Math.min(...lats), Math.max(...lngs), Math.max(...lats)],
+    v: 1,
+  };
+});
+
+const geoOf = new Map(areaPlaces.map((place, index) => [place.id, areaSeeds[index].geo]));
+
+// Which areas hold each place: its pin inside, and a bigger area for an area.
+const places: PotokPlace[] = [...points, ...areaPlaces].map((place) => {
+  const own = geoOf.get(place.id);
+  const holders = areaPlaces
+    .filter((area) => area.id !== place.id)
+    .filter((area) => contains(geoOf.get(area.id)!, place.lat, place.lng))
+    .filter((area) => !own || shapeArea(geoOf.get(area.id)!) > shapeArea(own))
+    .sort((a, b) => shapeArea(geoOf.get(a.id)!) - shapeArea(geoOf.get(b.id)!))
+    .map((area) => area.id);
+
+  return { ...place, areas: holders };
+});
 
 export function seedDevMap() {
   const params = new URLSearchParams(location.search);
@@ -74,5 +141,6 @@ export function seedDevMap() {
 
   if (!localStorage.getItem(PLACES_STORAGE_KEY)) {
     localStorage.setItem(PLACES_STORAGE_KEY, JSON.stringify(places));
+    localStorage.setItem(SHAPES_STORAGE_KEY, JSON.stringify(Object.fromEntries(geoOf)));
   }
 }

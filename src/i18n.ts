@@ -39,6 +39,20 @@ const sr = {
   openFailed: 'Ova grupa se nije otvorila. Možda više nije na mapi.',
   closed: 'Privatna grupa',
   places: 'mesta',
+  layers: 'Slojevi mape',
+  layerPlaces: 'Mesta',
+  layerPlacesHint: 'Grupe kao pinovi, po vrstama',
+  layerAreas: 'Područja',
+  layerAreasHint: 'Sva područja, kao granica ili pin',
+  area: 'Područje',
+  open: 'Otvori',
+  onlyInside: 'Samo unutra',
+  allGroups: 'Prikaži sve grupe',
+  zoomToArea: 'Uvećaj na područje',
+  alsoHere: 'Takođe ovde',
+  inArea: 'U: {n}',
+  clearInside: 'Prikaži grupe iz svih područja',
+  close: 'Zatvori',
 };
 
 type Key = keyof typeof sr;
@@ -80,6 +94,20 @@ const en: Record<Key, string> = {
   openFailed: 'This group did not open. It may no longer be on the map.',
   closed: 'Private group',
   places: 'places',
+  layers: 'Map layers',
+  layerPlaces: 'Places',
+  layerPlacesHint: 'Groups as pins, by kind',
+  layerAreas: 'Areas',
+  layerAreasHint: 'Every area, as a border or a pin',
+  area: 'Area',
+  open: 'Open',
+  onlyInside: 'Only inside',
+  allGroups: 'Show all groups',
+  zoomToArea: 'Zoom to the area',
+  alsoHere: 'Also here',
+  inArea: 'In {n}',
+  clearInside: 'Show the groups of every area',
+  close: 'Close',
 };
 
 const LETTERS: Record<string, string> = {
@@ -90,8 +118,18 @@ const LETTERS: Record<string, string> = {
 
 const PAIRS: Record<string, string> = { lj: 'љ', nj: 'њ', dž: 'џ' };
 
-/** Serbian Latin as Cyrillic: the app's own words, never what people typed. */
+/**
+ * Serbian Latin as Cyrillic: the app's own words, never what people typed.
+ * A `{name}` to fill in stays as it is.
+ */
 export function toCyrillic(text: string): string {
+  return text
+    .split(/(\{\w+\})/)
+    .map((part) => (/^\{\w+\}$/.test(part) ? part : letters(part)))
+    .join('');
+}
+
+function letters(text: string): string {
   return text.replace(/lj|nj|dž|[a-zčćđšž]/giu, (latin) => {
     const lower = latin.toLowerCase();
     const cyrillic = PAIRS[lower] ?? LETTERS[lower] ?? latin;

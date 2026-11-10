@@ -1,6 +1,7 @@
 import * as L from 'leaflet';
 import { html, nothing, render, type TemplateResult } from 'lit-html';
 import { unsafeSVG } from 'lit-html/directives/unsafe-svg.js';
+import { areasAt, LEVELS, levelFor, outerRings, shown, toLatLngs, type Geo, type Layers } from './areas';
 import { translator, type Translate } from './i18n';
 import { icon, type IconName } from './icons';
 import { clusterHtml, pinSvg } from './pins';
@@ -10,7 +11,6 @@ import {
   inView,
   kindsOnMap,
   lookOf,
-  ofKind,
   ringGradient,
   sameSpot,
   savedBounds,
@@ -26,6 +26,12 @@ import type { PotokConfig, PotokMapConfig, PotokPlace } from './potok';
 // own app works with that group's rights. Whoever may make sub-groups here
 // adds a place where the map's middle is.
 //
+// Areas among them (`shape: "area"`) are a layer of their own, as on Potok's
+// map: a border with its pin once wide enough, a pin among the others before
+// that, whatever the kind chips say. Their borders come from `placeShapes`
+// once per level of detail and stay here. A tap on the map off the pins
+// shows the areas there, and "only inside" keeps the pins of one area.
+//
 // Leaflet draws the map and the pins; lit-html draws what floats over it.
 
 type Adding =
@@ -33,6 +39,8 @@ type Adding =
   | { step: 'form'; lat: number; lng: number; name: string; kind: string; saving: boolean; error: string | null };
 
 type Panel = { kind: 'view' } | { kind: 'spot'; ids: number[] };
+
+type Here = { ids: number[]; selected: number };
 
 type State = {
   status: 'loading' | 'ready' | 'failed' | 'outdated';
@@ -46,6 +54,10 @@ type State = {
   menu: boolean;
   notice: { text: string; error: boolean } | null;
   appConfig: PotokConfig | null;
+  layers: Layers;
+  layerMenu: boolean;
+  inside: number | null;
+  here: Here | null;
 };
 
 const PLACE_ZOOM = 16;
@@ -54,6 +66,18 @@ const NOTICE_MS = 4000;
 // Everyone with the map open hears of a change at once: they read again at
 // a moment of their own, not all in the same one.
 const REFRESH_SPREAD_MS = 2000;
+// A tap waits this long, so that a double tap zooms instead.
+const TAP_DELAY_MS = 250;
+const SHAPES_PER_CALL = 100;
+// An area's pin stands over the other pins.
+const AREA_PIN_Z = 500;
+// The whole world, around the holes of the area "only inside" keeps.
+const WORLD: [number, number][] = [
+  [-89.9, -540],
+  [-89.9, 540],
+  [89.9, 540],
+  [89.9, -540],
+];
 
 export function mountMap(root: HTMLElement) {
   const lang = document.documentElement.lang;
@@ -78,12 +102,29 @@ export function mountMap(root: HTMLElement) {
     menu: false,
     notice: null,
     appConfig: null,
+    layers: { places: true, areas: true },
+    layerMenu: false,
+    inside: null,
+    here: null,
   };
 
   let map: L.Map | null = null;
   let index: Index | null = null;
   let draft: L.Marker | null = null;
   const markers = L.layerGroup();
+  const areaLayer = L.layerGroup();
+  const maskLayer = L.layerGroup();
+  const chosenLayer = L.layerGroup();
+  const borderPins = L.layerGroup();
+  let renderers: { areas: L.Renderer; mask: L.Renderer; chosen: L.Renderer } | null = null;
+  // What is shown at the current zoom (`shown`), and which areas are borders.
+  let borders: PotokPlace[] = [];
+  let pinned: PotokPlace[] = [];
+  let shownKey = '';
+  // Borders by `id:v:level`, and those on their way.
+  const shapes = new Map<string, Geo>();
+  const pendingShapes = new Set<string>();
+  let tapTimer: ReturnType<typeof setTimeout> | undefined;
   const byId = new Map<number, PotokPlace>();
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -145,7 +186,8 @@ export function mountMap(root: HTMLElement) {
 
     const selected = reply.places.some((place) => place.id === state.selected) ? state.selected : null;
     const panel = state.panel?.kind === 'spot' ? null : state.panel;
-    state = { ...state, places: reply.places, truncated: reply.truncated, selected, panel };
+    const inside = reply.places.some((place) => place.id === state.inside) ? state.inside : null;
+    state = { ...state, places: reply.places, truncated: reply.truncated, selected, panel, inside, here: null };
     rebuild();
     draw();
   };
@@ -168,17 +210,63 @@ export function mountMap(root: HTMLElement) {
     map.attributionControl.setPrefix('<a href="https://leafletjs.com" target="_blank" rel="noopener">Leaflet</a>');
     L.control.zoom({ position: 'bottomleft' }).addTo(map);
     L.tileLayer(config.tiles.url, { maxZoom: config.tiles.max_zoom, attribution: config.tiles.attribution }).addTo(map);
+
+    // Areas under the pins, the dimming around the one "only inside" keeps
+    // above them, and its border above that.
+    for (const [name, zIndex] of [
+      ['pmAreas', '350'],
+      ['pmMask', '360'],
+      ['pmChosen', '370'],
+    ] as const) {
+      map.createPane(name).style.zIndex = zIndex;
+    }
+
+    renderers = {
+      areas: L.svg({ pane: 'pmAreas', padding: 0.5 }),
+      mask: L.svg({ pane: 'pmMask', padding: 0.5 }),
+      chosen: L.svg({ pane: 'pmChosen', padding: 0.5 }),
+    };
+
+    areaLayer.addTo(map);
+    maskLayer.addTo(map);
+    chosenLayer.addTo(map);
+    borderPins.addTo(map);
     markers.addTo(map);
     map.fitBounds(bounds);
 
     map.on('moveend', () => {
-      drawMarkers();
+      // A zoom can turn an area from a pin into a border and back.
+      if (shownSignature() !== shownKey) rebuild();
+      else drawMarkers();
+
+      drawAreas();
+      fetchShapes();
       if (state.panel?.kind === 'view') draw();
     });
 
-    map.on('click', () => {
-      if (state.menu) set({ menu: false });
+    map.on('click', (event: L.LeafletMouseEvent) => {
+      if (state.menu || state.layerMenu) {
+        set({ menu: false, layerMenu: false });
+        return;
+      }
+
+      clearTimeout(tapTimer);
+      tapTimer = setTimeout(() => tapAt(event.latlng), TAP_DELAY_MS);
     });
+
+    map.on('dblclick zoomstart', () => clearTimeout(tapTimer));
+  };
+
+  const shownOptions = () => ({
+    layers: state.layers,
+    kind: state.kind,
+    inside: state.inside,
+    zoom: Math.round(map?.getZoom() ?? 0),
+  });
+
+  const shownSignature = () => {
+    const { borders: drawn, pins: rest } = shown(state.places, shownOptions());
+    return `${drawn.map((place) => place.id).join(',')}|${rest.length}`;
   };
 
   const rebuild = () => {
@@ -188,8 +276,177 @@ export function mountMap(root: HTMLElement) {
     const kind = state.kind !== null && state.places.some((place) => place.kind === state.kind) ? state.kind : null;
     state = { ...state, kind };
 
-    index = buildIndex(ofKind(state.places, kind), pins(), map?.getMaxZoom() ?? 19);
+    const current = shown(state.places, shownOptions());
+    borders = current.borders;
+    pinned = current.pins;
+    shownKey = shownSignature();
+
+    index = buildIndex(pinned, pins(), map?.getMaxZoom() ?? 19);
     drawMarkers();
+    drawAreas();
+    fetchShapes();
+  };
+
+  // --- Areas ---
+
+  const shapeKey = (place: PotokPlace, level: number) => `${place.id}:${place.v ?? 0}:${level}`;
+
+  // The border at this zoom's level of detail, or another level of the same
+  // version while that one is on its way.
+  const shapeOf = (place: PotokPlace): Geo | null => {
+    const level = levelFor(Math.round(map?.getZoom() ?? 0));
+    const nearest = [...LEVELS].sort((a, b) => Math.abs(a - level) - Math.abs(b - level));
+
+    for (const candidate of nearest) {
+      const shape = shapes.get(shapeKey(place, candidate));
+      if (shape) return shape;
+    }
+
+    return null;
+  };
+
+  const fetchShapes = () => {
+    if (!map || borders.length === 0) return;
+
+    const zoom = Math.round(map.getZoom());
+    const level = levelFor(zoom);
+    const missing = borders.filter((place) => {
+      const key = shapeKey(place, level);
+      return !shapes.has(key) && !pendingShapes.has(key);
+    });
+
+    for (let start = 0; start < missing.length; start += SHAPES_PER_CALL) {
+      const batch = missing.slice(start, start + SHAPES_PER_CALL);
+      const keys = batch.map((place) => shapeKey(place, level));
+      keys.forEach((key) => pendingShapes.add(key));
+
+      void potok
+        .placeShapes(
+          batch.map((place) => place.id),
+          zoom,
+        )
+        .then((reply) => {
+          if (!reply.ok) return;
+          for (const shape of reply.shapes) shapes.set(`${shape.id}:${shape.v}:${reply.level}`, shape.geojson);
+          drawAreas();
+        })
+        .catch(() => {})
+        .finally(() => keys.forEach((key) => pendingShapes.delete(key)));
+    }
+  };
+
+  const drawAreas = () => {
+    if (!map || !renderers || !state.config) return;
+
+    areaLayer.clearLayers();
+    maskLayer.clearLayers();
+    chosenLayer.clearLayers();
+    borderPins.clearLayers();
+
+    const view = map.getBounds();
+    const holes: [number, number][][] = [];
+
+    for (const place of borders) {
+      const geo = shapeOf(place);
+      const color = lookOf(place, pins()).color;
+
+      if (geo && place.bbox) {
+        const [west, south, east, north] = place.bbox;
+        const covers =
+          west <= view.getWest() && east >= view.getEast() && south <= view.getSouth() && north >= view.getNorth();
+        const classes = ['pm-area', covers ? 'is-outline' : '', state.here?.selected === place.id ? 'is-selected' : ''];
+
+        L.polygon(toLatLngs(geo), {
+          renderer: renderers.areas,
+          color,
+          fillColor: color,
+          weight: 2,
+          className: classes.filter(Boolean).join(' '),
+        }).addTo(areaLayer);
+
+        if (state.inside === place.id) {
+          holes.push(...outerRings(geo));
+
+          L.polygon(toLatLngs(geo), {
+            renderer: renderers.chosen,
+            color,
+            weight: 3,
+            fill: false,
+            interactive: false,
+            className: 'pm-area-chosen',
+          }).addTo(chosenLayer);
+        }
+      }
+
+      borderPins.addLayer(pinMarker(place, AREA_PIN_Z));
+    }
+
+    if (holes.length > 0) {
+      L.polygon([WORLD, ...holes], {
+        renderer: renderers.mask,
+        stroke: false,
+        interactive: false,
+        className: 'pm-area-mask',
+      }).addTo(maskLayer);
+    }
+  };
+
+  // A tap off the pins: the areas drawn there, smallest first.
+  const tapAt = (latlng: L.LatLng) => {
+    if (!state.layers.areas || state.adding) return;
+
+    const drawn = borders.flatMap((place) => {
+      const geo = shapeOf(place);
+      return geo ? [{ id: place.id, geo }] : [];
+    });
+
+    const ids = areasAt(drawn, latlng.lat, latlng.wrap().lng);
+    state = { ...state, here: ids.length > 0 ? { ids, selected: ids[0] } : null };
+    if (ids.length > 0) state = { ...state, panel: null };
+    draw();
+    drawAreas();
+  };
+
+  const pickHere = (id: number) => {
+    if (!state.here) return;
+    state = { ...state, here: { ...state.here, selected: id } };
+    draw();
+    drawAreas();
+  };
+
+  const closeHere = () => {
+    state = { ...state, here: null };
+    draw();
+    drawAreas();
+  };
+
+  const zoomToArea = (place: PotokPlace) => {
+    if (!map || !place.bbox) return;
+    const [west, south, east, north] = place.bbox;
+    map.fitBounds(
+      [
+        [south, west],
+        [north, east],
+      ],
+      { padding: FIT_PADDING },
+    );
+  };
+
+  // Only the pins inside one area, or all again; going inside fits the map to it.
+  const setInside = (id: number | null) => {
+    state = { ...state, inside: id, panel: state.panel?.kind === 'spot' ? null : state.panel };
+    rebuild();
+    draw();
+
+    const place = id === null ? undefined : byId.get(id);
+    if (place) zoomToArea(place);
+  };
+
+  const toggleLayer = (key: keyof Layers) => {
+    const layers = { ...state.layers, [key]: !state.layers[key] };
+    state = { ...state, layers, here: layers.areas ? state.here : null };
+    rebuild();
+    draw();
   };
 
   const drawMarkers = () => {
@@ -225,25 +482,29 @@ export function mountMap(root: HTMLElement) {
         const place = byId.get(props.id);
         if (!place) continue;
 
-        const selected = state.selected === place.id;
-        const marker = L.marker([lat, lng], {
-          icon: L.divIcon({
-            html: pinSvg(lookOf(place, pins()), pins(), { locked: !place.is_public }),
-            className: selected ? 'pm-pin is-selected' : 'pm-pin',
-            iconSize: [32, 40],
-            iconAnchor: [16, 39],
-          }),
-          title: place.name,
-          alt: place.name,
-          keyboard: true,
-          riseOnHover: true,
-          zIndexOffset: selected ? 1000 : 0,
-        });
-
-        marker.on('click', () => void select(place));
-        markers.addLayer(marker);
+        markers.addLayer(pinMarker(place, 0));
       }
     }
+  };
+
+  const pinMarker = (place: PotokPlace, zIndex: number) => {
+    const selected = state.selected === place.id;
+    const marker = L.marker([place.lat, place.lng], {
+      icon: L.divIcon({
+        html: pinSvg(lookOf(place, pins()), pins(), { locked: !place.is_public }),
+        className: selected ? 'pm-pin is-selected' : 'pm-pin',
+        iconSize: [32, 40],
+        iconAnchor: [16, 39],
+      }),
+      title: place.name,
+      alt: place.name,
+      keyboard: true,
+      riseOnHover: true,
+      zIndexOffset: selected ? 1000 : zIndex,
+    });
+
+    marker.on('click', () => void select(place));
+    return marker;
   };
 
   // A cluster opens up a zoom level at a time; one that never would (places
@@ -269,12 +530,14 @@ export function mountMap(root: HTMLElement) {
     state = { ...state, selected: place.id, menu: false, panel: state.panel?.kind === 'spot' ? null : state.panel };
     draw();
     drawMarkers();
+    drawAreas();
 
     const reply = await potok.showGroup(place.id).catch(() => null);
 
     if (!reply || !reply.ok) {
       state = { ...state, selected: null };
       drawMarkers();
+      drawAreas();
       notify(reply && !reply.ok && reply.error === 'unknown_method' ? t('outdated') : t('openFailed'), true);
       if (reply && !reply.ok && reply.error === 'not_found') void refresh();
     }
@@ -285,14 +548,24 @@ export function mountMap(root: HTMLElement) {
     void select(place);
   };
 
+  // Everything that would be shown: borders whole, pins where they stand.
   const fitAll = () => {
-    const shown = ofKind(state.places, state.kind);
-    if (!map || shown.length === 0) return;
+    const everything = shown(state.places, { ...shownOptions(), zoom: 0 }).pins;
+    const corners: [number, number][] = [
+      ...everything.map((place) => [place.lat, place.lng] as [number, number]),
+      ...state.places
+        .filter((place) => state.layers.areas && place.bbox)
+        .flatMap((place) => {
+          const [west, south, east, north] = place.bbox!;
+          return [
+            [south, west],
+            [north, east],
+          ] as [number, number][];
+        }),
+    ];
 
-    map.fitBounds(L.latLngBounds(shown.map((place) => [place.lat, place.lng] as [number, number])), {
-      padding: FIT_PADDING,
-      maxZoom: PLACE_ZOOM,
-    });
+    if (!map || corners.length === 0) return;
+    map.fitBounds(L.latLngBounds(corners), { padding: FIT_PADDING, maxZoom: PLACE_ZOOM });
   };
 
   const currentBounds = (): Bounds => {
@@ -305,7 +578,8 @@ export function mountMap(root: HTMLElement) {
 
   // --- Adding a place ---
 
-  const startAdding = () => set({ adding: { step: 'aim' }, panel: null, menu: false, selected: null });
+  const startAdding = () =>
+    set({ adding: { step: 'aim' }, panel: null, menu: false, layerMenu: false, selected: null, here: null });
 
   const cancelAdding = () => {
     draft?.remove();
@@ -433,10 +707,28 @@ export function mountMap(root: HTMLElement) {
 
     const config = state.config!;
     const kinds = kindsOnMap(state.places, config.pins);
+    const hasAreas = state.places.some((place) => place.shape === 'area');
+    const insidePlace = state.inside === null ? undefined : byId.get(state.inside);
 
     return html`
       <div class="pm-top">
         ${kinds.length > 1 ? kindChips(kinds) : nothing}
+        ${insidePlace
+          ? html`<div class="pm-chips">
+              <button
+                type="button"
+                id="pm-inside"
+                class="pm-chip is-active"
+                aria-label=${t('clearInside')}
+                title=${t('clearInside')}
+                @click=${() => setInside(null)}
+              >
+                ${icon('area', 'size-4')}
+                <span>${t('inArea', { n: insidePlace.name })}</span>
+                ${icon('close', 'size-4')}
+              </button>
+            </div>`
+          : nothing}
         ${state.truncated
           ? html`<p class="pm-note">${t('truncated', { n: state.places.length })}</p>`
           : nothing}
@@ -450,15 +742,24 @@ export function mountMap(root: HTMLElement) {
           () => set({ panel: state.panel?.kind === 'view' ? null : { kind: 'view' }, menu: false }),
           state.panel?.kind === 'view',
         )}
-        ${config.can_edit_view
-          ? roundButton('bookmark', t('startView'), () => set({ menu: !state.menu }), state.menu)
+        ${hasAreas
+          ? roundButton(
+              'layers',
+              t('layers'),
+              () => set({ layerMenu: !state.layerMenu, menu: false }),
+              state.layerMenu || !state.layers.places || !state.layers.areas,
+            )
           : nothing}
-        ${state.menu ? viewMenu() : nothing}
+        ${config.can_edit_view
+          ? roundButton('bookmark', t('startView'), () => set({ menu: !state.menu, layerMenu: false }), state.menu)
+          : nothing}
+        ${state.menu ? viewMenu() : nothing} ${state.layerMenu ? layerMenu() : nothing}
       </div>
       ${state.panel ? panel(state.panel) : nothing}
+      ${state.here && !state.adding && !state.panel ? hereCard(state.here) : nothing}
       ${state.adding?.step === 'aim' ? aimCard() : nothing}
       ${state.adding?.step === 'form' ? placeForm(state.adding, config) : nothing}
-      ${config.can_create_places && !state.adding && !state.panel
+      ${config.can_create_places && !state.adding && !state.panel && !state.here
         ? html`<div class="pm-bottom">
             <button type="button" id="pm-add" class="pm-pill pm-pill-primary pm-fab" @click=${startAdding}>
               ${icon('plus', 'size-5')} ${t('addPlace')}
@@ -510,6 +811,82 @@ export function mountMap(root: HTMLElement) {
     ${icon(name, 'size-5')}
   </button>`;
 
+  const layerMenu = () => html`<div class="pm-menu" role="menu" aria-label=${t('layers')}>
+    ${layerItem('places', 'pin', t('layerPlaces'), t('layerPlacesHint'))}
+    ${layerItem('areas', 'area', t('layerAreas'), t('layerAreasHint'))}
+  </div>`;
+
+  const layerItem = (key: keyof Layers, name: IconName, title: string, hint: string) => {
+    const on = state.layers[key];
+
+    return html`<button
+      type="button"
+      role="menuitemcheckbox"
+      id=${`pm-layer-${key}`}
+      aria-checked=${String(on)}
+      class="pm-menu-item"
+      @click=${() => toggleLayer(key)}
+    >
+      ${icon(name, 'size-4')}
+      <span class="min-w-0 flex-1">
+        <span class="block font-medium">${title}</span>
+        <span class="block text-xs opacity-65">${hint}</span>
+      </span>
+      <span class="pm-switch ${on ? 'is-on' : ''}" aria-hidden="true"></span>
+    </button>`;
+  };
+
+  // The areas where the viewer tapped: the one picked, what it does, and the
+  // bigger ones around it.
+  const hereCard = (here: Here) => {
+    const area = byId.get(here.selected);
+    if (!area) return nothing;
+
+    const others = here.ids
+      .filter((id) => id !== here.selected)
+      .map((id) => byId.get(id))
+      .filter((place): place is PotokPlace => place !== undefined);
+    const chosen = state.inside === area.id;
+
+    return html`<section class="pm-sheet pm-here" id="pm-here" aria-label=${area.name}>
+      <header class="flex items-center gap-3">
+        <span class="pm-row-pin">${unsafeSVG(pinSvg(lookOf(area, pins()), pins(), { size: 32, locked: !area.is_public }))}</span>
+        <span class="min-w-0 flex-1">
+          <span class="block truncate font-semibold">${area.name}</span>
+          <span class="block truncate text-xs opacity-65">${t('area')}${area.is_public ? '' : ` · ${t('closed')}`}</span>
+        </span>
+        ${roundButton('close', t('close'), closeHere)}
+      </header>
+      <div class="flex flex-wrap items-center gap-2">
+        <button type="button" id="pm-here-open" class="pm-pill" @click=${() => void select(area)}>
+          ${icon('open', 'size-4')} ${t('open')}
+        </button>
+        <button
+          type="button"
+          id="pm-here-inside"
+          class="pm-pill ${chosen ? 'pm-pill-primary' : ''}"
+          aria-pressed=${String(chosen)}
+          @click=${() => setInside(chosen ? null : area.id)}
+        >
+          ${icon('area', 'size-4')} ${chosen ? t('allGroups') : t('onlyInside')}
+        </button>
+        ${roundButton('zoomIn', t('zoomToArea'), () => zoomToArea(area))}
+      </div>
+      ${others.length > 0
+        ? html`<div>
+            <p class="text-xs font-semibold opacity-65">${t('alsoHere')}</p>
+            <div class="mt-1.5 flex flex-wrap gap-1.5">
+              ${others.map(
+                (other) => html`<button type="button" class="pm-chip" @click=${() => pickHere(other.id)}>
+                  <span>${other.name}</span>
+                </button>`,
+              )}
+            </div>
+          </div>`
+        : nothing}
+    </section>`;
+  };
+
   const viewMenu = () => html`<div class="pm-menu" role="menu">
     <button type="button" role="menuitem" class="pm-menu-item" @click=${() => void saveView(currentBounds())}>
       ${icon('bookmark', 'size-4')} ${t('saveView')}
@@ -532,7 +909,7 @@ export function mountMap(root: HTMLElement) {
       current.kind === 'spot'
         ? current.ids.map((id) => byId.get(id)).filter((place): place is PotokPlace => place !== undefined)
         : map
-          ? inView(ofKind(state.places, state.kind), currentBounds(), lang)
+          ? inView([...borders, ...pinned], currentBounds(), lang)
           : [];
 
     return html`<section class="pm-panel" aria-label=${current.kind === 'spot' ? t('atSpot') : t('list')}>
@@ -552,6 +929,8 @@ export function mountMap(root: HTMLElement) {
 
   const placeRow = (place: PotokPlace) => {
     const kind = pins().kinds.find((row) => row.key === place.kind);
+    const holder = place.areas.length > 0 ? byId.get(place.areas[0]) : undefined;
+    const what = place.shape === 'area' ? t('area') : (kind?.title ?? '');
 
     return html`<li>
       <button
@@ -563,7 +942,7 @@ export function mountMap(root: HTMLElement) {
         <span class="min-w-0 flex-1">
           <span class="block truncate font-medium">${place.name}</span>
           <span class="block truncate text-xs opacity-65">
-            ${kind?.title ?? ''}${place.is_public ? '' : ` · ${t('closed')}`}
+            ${what}${holder ? ` · ${t('inArea', { n: holder.name })}` : ''}${place.is_public ? '' : ` · ${t('closed')}`}
           </span>
         </span>
       </button>
@@ -643,14 +1022,16 @@ export function mountMap(root: HTMLElement) {
     if (state.selected !== id) return;
     state = { ...state, selected: null };
     drawMarkers();
+    drawAreas();
     draw();
   });
 
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
     if (state.adding) cancelAdding();
-    else if (state.menu) set({ menu: false });
+    else if (state.menu || state.layerMenu) set({ menu: false, layerMenu: false });
     else if (state.panel) set({ panel: null });
+    else if (state.here) closeHere();
   });
 
   // Leaflet measures its box once; the frame can change size with the page.

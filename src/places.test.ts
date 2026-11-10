@@ -27,6 +27,8 @@ const place = (id: number, lat: number, lng: number, kind = 'chat', pin: string 
   pin,
   picture_url: `/avatar/group/${id}`,
   is_public: true,
+  shape: 'point',
+  areas: [],
 });
 
 describe('a pin', () => {
@@ -129,6 +131,9 @@ describe('the words', () => {
     expect(keys.en).toEqual(keys.sr);
     expect(translator('sr')('truncated', { n: 2000 })).toBe('Prikazano je prvih 2000 mesta.');
     expect(translator('sr-Cyrl')('addPlace')).toBe('Додај место');
+    // A name to fill in stays in Latin letters, so Cyrillic fills it in too.
+    expect(translator('sr-Cyrl')('truncated', { n: 2000 })).toBe('Приказано је првих 2000 места.');
+    expect(translator('sr-Cyrl')('inArea', { n: 'Liman' })).toBe('У: Liman');
     expect(translator('en')('addPlace')).toBe('Add a place');
   });
 });

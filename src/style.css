@@ -588,13 +588,109 @@ body {
   flex-shrink: 0;
 }
 
+/* --- Areas: a border in the tone of the area's pin over a light fill, the
+   outline only for one that covers the whole view, the rest dimmed around
+   the area "only inside" keeps. --- */
+
+.pm-map .pm-area {
+  fill-opacity: 0.12;
+  stroke-opacity: 0.85;
+  transition: fill-opacity 150ms ease-out, stroke-width 150ms ease-out;
+}
+
+.pm-map .pm-area:hover {
+  fill-opacity: 0.2;
+}
+
+.pm-map .pm-area.is-outline {
+  fill-opacity: 0;
+}
+
+.pm-map .pm-area.is-selected {
+  fill-opacity: 0.26;
+  stroke-opacity: 1;
+  stroke-width: 3.5px;
+}
+
+.pm-map .pm-area-mask {
+  fill: #0f172a;
+  fill-opacity: 0.28;
+}
+
+.pm-map .pm-area-chosen {
+  stroke-opacity: 1;
+  filter: drop-shadow(0 0 1.5px rgb(255 255 255 / 0.9));
+}
+
+:where([data-theme="dark"]) .pm-map .pm-area {
+  fill-opacity: 0.18;
+}
+
+:where([data-theme="dark"]) .pm-map .pm-area-mask {
+  fill: #000000;
+  fill-opacity: 0.45;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) .pm-map .pm-area {
+    fill-opacity: 0.18;
+  }
+
+  :root:not([data-theme]) .pm-map .pm-area-mask {
+    fill: #000000;
+    fill-opacity: 0.45;
+  }
+}
+
+/* A layer's switch in the layers menu. */
+.pm-switch {
+  position: relative;
+  display: inline-block;
+  flex-shrink: 0;
+  width: 2.25rem;
+  height: 1.25rem;
+  border-radius: 9999px;
+  background: var(--color-base-300);
+  transition: background-color 150ms ease-out;
+}
+
+.pm-switch::after {
+  content: "";
+  position: absolute;
+  top: 0.125rem;
+  left: 0.125rem;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 9999px;
+  background: var(--color-base-100);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.25);
+  transition: transform 150ms ease-out;
+}
+
+.pm-switch.is-on {
+  background: var(--color-primary);
+}
+
+.pm-switch.is-on::after {
+  transform: translateX(1rem);
+}
+
+.pm-here .pm-round {
+  width: 2.25rem;
+  height: 2.25rem;
+  box-shadow: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .pm-pin svg,
   .pm-cluster,
   .pm-sheet,
   .pm-panel,
   .pm-aim,
-  .pm-pin.is-draft svg {
+  .pm-pin.is-draft svg,
+  .pm-map .pm-area,
+  .pm-switch,
+  .pm-switch::after {
     animation: none;
     transition: none;
   }
