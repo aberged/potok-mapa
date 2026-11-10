@@ -76,8 +76,6 @@ const SHAPES_PER_CALL = 100;
 const MAX_BORDERS = 300;
 // How long a move to a place or an area takes, in seconds, as on Potok's map.
 const FLY_SECONDS = 0.5;
-// An area's pin stands over the other pins.
-const AREA_PIN_Z = 500;
 // The whole world, around the holes of the area "only inside" keeps.
 const WORLD: [number, number][] = [
   [-89.9, -540],
@@ -123,7 +121,6 @@ export function mountMap(root: HTMLElement) {
   const areaLayer = L.layerGroup();
   const maskLayer = L.layerGroup();
   const chosenLayer = L.layerGroup();
-  const borderPins = L.layerGroup();
   let renderers: { areas: L.Renderer; mask: L.Renderer; chosen: L.Renderer } | null = null;
   // What is shown at the current zoom (`shown`), and which areas are borders.
   let borders: PotokPlace[] = [];
@@ -242,7 +239,6 @@ export function mountMap(root: HTMLElement) {
     areaLayer.addTo(map);
     maskLayer.addTo(map);
     chosenLayer.addTo(map);
-    borderPins.addTo(map);
     markers.addTo(map);
     map.fitBounds(bounds);
 
@@ -366,9 +362,7 @@ export function mountMap(root: HTMLElement) {
     areaLayer.clearLayers();
     maskLayer.clearLayers();
     chosenLayer.clearLayers();
-    borderPins.clearLayers();
     areaPaths.clear();
-    for (const place of borders) pinMarkers.delete(place.id);
 
     const view = map.getBounds();
     const holes: [number, number][][] = [];
@@ -393,10 +387,6 @@ export function mountMap(root: HTMLElement) {
 
         areaPaths.set(place.id, path);
       }
-
-      const marker = pinMarker(place, AREA_PIN_Z);
-      borderPins.addLayer(marker);
-      pinMarkers.set(place.id, marker);
     }
 
     const inside = insideArea();
@@ -468,7 +458,7 @@ export function mountMap(root: HTMLElement) {
     for (const [id, marker] of pinMarkers) {
       const selected = state.selected === id;
       marker.getElement()?.classList.toggle('is-selected', selected);
-      marker.setZIndexOffset(selected ? 1000 : byId.get(id)?.shape === 'area' && borders.some((b) => b.id === id) ? AREA_PIN_Z : 0);
+      marker.setZIndexOffset(selected ? 1000 : 0);
     }
   };
 
@@ -535,14 +525,14 @@ export function mountMap(root: HTMLElement) {
         const place = byId.get(props.id);
         if (!place) continue;
 
-        const marker = pinMarker(place, 0);
+        const marker = pinMarker(place);
         markers.addLayer(marker);
         pinMarkers.set(place.id, marker);
       }
     }
   };
 
-  const pinMarker = (place: PotokPlace, zIndex: number) => {
+  const pinMarker = (place: PotokPlace) => {
     const selected = state.selected === place.id;
     const marker = L.marker([place.lat, place.lng], {
       icon: L.divIcon({
@@ -555,7 +545,7 @@ export function mountMap(root: HTMLElement) {
       alt: place.name,
       keyboard: true,
       riseOnHover: true,
-      zIndexOffset: selected ? 1000 : zIndex,
+      zIndexOffset: selected ? 1000 : 0,
     });
 
     marker.on('click', () => void select(place));
@@ -981,7 +971,7 @@ export function mountMap(root: HTMLElement) {
       current.kind === 'spot'
         ? current.ids.map((id) => byId.get(id)).filter((place): place is PotokPlace => place !== undefined)
         : map
-          ? inView([...borders, ...pinned], currentBounds(), lang)
+          ? inView(pinned, currentBounds(), lang)
           : [];
 
     return html`<section class="pm-panel" aria-label=${current.kind === 'spot' ? t('atSpot') : t('list')}>

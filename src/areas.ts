@@ -3,15 +3,16 @@ import type { PotokPlace, PotokPlaceShape } from './potok';
 
 // Areas among the map's places (`shape: "area"`), as Potok's own map shows
 // them: an area is only the shape of its group, which the kind chips and the
-// search keep or leave out like any place, drawn as a border with its pin
-// once it is wide enough on the screen, and a pin among the others before
-// that. Kept free of the DOM (areas.test.ts).
+// search keep or leave out like any place. Its pin is one of the pins, in the
+// clusters like any other, and once the area is wide enough on the screen its
+// border is drawn under the pins as well. Kept free of the DOM
+// (areas.test.ts).
 
 export type Geo = PotokPlaceShape['geojson'];
 export type Layers = { places: boolean; areas: boolean };
 
-/** How wide an area must be on the screen to be drawn as a border, as on Potok's map. */
-export const DRAWN_PX = 28;
+/** How wide an area must be on the screen to be drawn as a border, two pins wide, as on Potok's map. */
+export const DRAWN_PX = 64;
 
 /** The levels of detail Potok simplifies borders for (`placeShapes`). */
 export const LEVELS = [6, 8, 10, 12, 14, 16];
@@ -61,10 +62,10 @@ export function kept(places: PotokPlace[], options: Omit<ShownOptions, 'zoom'>):
 }
 
 /**
- * What the map shows at `zoom`, out of the places kept (`kept`). `borders`:
- * the areas drawn as borders, the biggest first so that smaller ones lie on
- * top, each with its own pin. `pins`: what gathers into clusters, the rest,
- * or with areas off every place.
+ * What the map shows at `zoom`, out of the places kept (`kept`). `pins`:
+ * every one of them, which gather into clusters, areas too. `borders`: the
+ * areas also drawn as borders (none with areas off), the biggest first so
+ * that smaller ones lie on top.
  */
 export function shown(places: PotokPlace[], options: ShownOptions): { borders: PotokPlace[]; pins: PotokPlace[] } {
   const keep = kept(places, options);
@@ -72,7 +73,7 @@ export function shown(places: PotokPlace[], options: ShownOptions): { borders: P
 
   return {
     borders: keep.filter(drawn).sort((a, b) => boxSize(b) - boxSize(a)),
-    pins: keep.filter((place) => !drawn(place)),
+    pins: keep,
   };
 }
 
