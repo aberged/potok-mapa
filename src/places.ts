@@ -8,28 +8,37 @@ import type { PotokMapConfig, PotokPinPath, PotokPlace } from './potok';
 export type Pins = PotokMapConfig['pins'];
 export type Bounds = [[number, number], [number, number]];
 
-/** How one pin is drawn: the tone's colour and the glyph, or the group's picture. */
+/**
+ * How one pin is drawn: the tone's colour and the glyph, or the group's
+ * picture, and the kind's small `mark` when the group picked its pin.
+ */
 export type Look = {
   tone: string;
   color: string;
   paths: PotokPinPath[];
   picture: string | null;
+  mark: PotokPinPath[] | null;
 };
 
 const FALLBACK_COLOR = '#0a5bc4';
 
-/** A place's own icon while the catalogue has it, its kind's otherwise, as Potok does. */
+/**
+ * A place's own icon while the catalogue has it, its kind's otherwise, as
+ * Potok does. A pin of its own keeps the kind's mark, as the avatar does.
+ */
 export function lookOf(place: Pick<PotokPlace, 'kind' | 'pin' | 'picture_url'>, pins: Pins): Look {
   const kind = pins.kinds.find((row) => row.key === place.kind) ?? pins.kinds.find((row) => row.key === 'none');
   const icon = place.pin && place.pin !== 'picture' ? pins.icons.find((row) => row.key === place.pin) : undefined;
   const base = icon ?? kind;
   const tone = base?.tone ?? 'kind';
+  const own = icon !== undefined || place.pin === 'picture';
 
   return {
     tone,
     color: pins.tones[tone] ?? FALLBACK_COLOR,
     paths: base?.paths ?? [],
     picture: place.pin === 'picture' ? place.picture_url : null,
+    mark: own ? (kind?.mark ?? null) : null,
   };
 }
 

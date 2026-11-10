@@ -62,6 +62,35 @@ describe('a pin', () => {
     expect(pinSvg(look, pins)).not.toContain('<rect');
     expect(escapeAttribute('"><script>')).toBe('&quot;&gt;&lt;script&gt;');
   });
+
+  it("keeps its kind's mark on an icon or the picture it picked, as the avatar does", () => {
+    const chat = pins.kinds.find((kind) => kind.key === 'chat')!;
+    expect(chat.mark).toBeTruthy();
+
+    for (const pin of ['shop', 'picture']) {
+      const look = lookOf(place(1, 44, 20, 'chat', pin), pins);
+      expect(look.mark).toEqual(chat.mark);
+      expect(pinSvg(look, pins)).toContain('data-pin-mark');
+    }
+  });
+
+  it('has no mark when the pin already shows the kind, or the group has none', () => {
+    for (const look of [
+      lookOf(place(1, 44, 20, 'chat'), pins),
+      lookOf(place(1, 44, 20, 'chat', 'retired'), pins),
+      lookOf(place(1, 44, 20, 'none', 'shop'), pins),
+      lookOf(place(1, 44, 20, 'castle', 'shop'), pins),
+    ]) {
+      expect(look.mark).toBeNull();
+      expect(pinSvg(look, pins)).not.toContain('data-pin-mark');
+    }
+  });
+
+  it('puts the lock on the left and the mark on the right', () => {
+    const svg = pinSvg(lookOf(place(1, 44, 20, 'chat', 'shop'), pins), pins, { locked: true });
+    expect(svg).toContain('<g data-pin-lock><circle cx="5.5"');
+    expect(svg).toContain('<g data-pin-mark><circle cx="26.5"');
+  });
 });
 
 describe('clusters', () => {
