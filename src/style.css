@@ -679,6 +679,40 @@ body {
   }
 }
 
+/* --- Routes: a line in the tone of the route's pin over a casing that keeps
+   it apart from the streets, a ring at its end, thicker while its group is
+   open. A wider line nobody sees takes the tap. --- */
+
+.pm-map .pm-route {
+  stroke-opacity: 0.95;
+  transition: stroke-width 150ms ease-out;
+}
+
+.pm-map .pm-route.is-selected {
+  stroke-width: 5.5px;
+  stroke-opacity: 1;
+}
+
+.pm-map .pm-route-casing {
+  stroke-opacity: 0.85;
+}
+
+.pm-map .pm-route-hit {
+  cursor: pointer;
+}
+
+:where([data-theme="dark"]) .pm-map .pm-route-casing {
+  stroke: #0f172a;
+  stroke-opacity: 0.7;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) .pm-map .pm-route-casing {
+    stroke: #0f172a;
+    stroke-opacity: 0.7;
+  }
+}
+
 /* A layer's switch in the layers menu. */
 .pm-switch {
   position: relative;
@@ -726,6 +760,7 @@ body {
   .pm-aim,
   .pm-pin.is-draft svg,
   .pm-map .pm-area,
+  .pm-map .pm-route,
   .pm-map .leaflet-bottom,
   .pm-switch,
   .pm-switch::after {

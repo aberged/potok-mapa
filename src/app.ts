@@ -1,7 +1,22 @@
 import * as L from 'leaflet';
 import { html, nothing, render, type TemplateResult } from 'lit-html';
 import { unsafeSVG } from 'lit-html/directives/unsafe-svg.js';
-import { areasAt, inBox, kept, LEVELS, levelFor, outerRings, shown, toLatLngs, type Geo, type Layers } from './areas';
+import {
+  areasAt,
+  distance,
+  inBox,
+  kept,
+  LEVELS,
+  levelFor,
+  lineEnd,
+  lineLatLngs,
+  outerRings,
+  shown,
+  toLatLngs,
+  type Geo,
+  type Layers,
+  type Shape,
+} from './areas';
 import { translator, type Translate } from './i18n';
 import { icon, type IconName } from './icons';
 import { clusterHtml, pinSvg } from './pins';
@@ -33,6 +48,12 @@ import type { PotokConfig, PotokMapConfig, PotokPlace } from './potok';
 // the part of the map in view, and stay here. A tap on the map off the pins
 // shows the areas there, and "only inside" keeps the places of one area,
 // which stays outlined.
+//
+// A route (`shape: "route"`) is the same: its pin, at its start, is among the
+// pins, and once wide enough its line is drawn over the borders, in the tone
+// of its pin over a casing, with a ring at its end. A tap on the line opens
+// the group as a tap on its pin does, and "only inside" keeps a route that
+// passes through the area.
 //
 // Leaflet draws the map and the pins; lit-html draws what floats over it.
 
@@ -74,6 +95,8 @@ const TAP_DELAY_MS = 250;
 const SHAPES_PER_CALL = 100;
 // Borders a view draws at most, the biggest first, as on Potok's map.
 const MAX_BORDERS = 300;
+// Lines a view draws at most, the widest first, as on Potok's map.
+const MAX_LINES = 150;
 // How long a move to a place or an area takes, in seconds, as on Potok's map.
 const FLY_SECONDS = 0.5;
 // The whole world, around the holes of the area "only inside" keeps.
@@ -107,7 +130,7 @@ export function mountMap(root: HTMLElement) {
     menu: false,
     notice: null,
     appConfig: null,
-    layers: { places: true, areas: true },
+    layers: { places: true, areas: true, routes: true },
     layerMenu: false,
     inside: null,
     here: null,
@@ -121,17 +144,21 @@ export function mountMap(root: HTMLElement) {
   const areaLayer = L.layerGroup();
   const maskLayer = L.layerGroup();
   const chosenLayer = L.layerGroup();
-  let renderers: { areas: L.Renderer; mask: L.Renderer; chosen: L.Renderer } | null = null;
-  // What is shown at the current zoom (`shown`), and which areas are borders.
+  const routeLayer = L.layerGroup();
+  let renderers: { areas: L.Renderer; mask: L.Renderer; chosen: L.Renderer; routes: L.Renderer } | null = null;
+  // What is shown at the current zoom (`shown`): which areas are borders and
+  // which routes are lines.
   let borders: PotokPlace[] = [];
+  let lines: PotokPlace[] = [];
   let pinned: PotokPlace[] = [];
   let shownKey = '';
   // The markers of pins and the borders drawn, by place, so a pick only
   // changes their look.
   const pinMarkers = new Map<number, L.Marker>();
   const areaPaths = new Map<number, L.Polygon>();
-  // Borders by `id:v:level`, and those on their way.
-  const shapes = new Map<string, Geo>();
+  const routePaths = new Map<number, L.Polyline>();
+  // Borders and lines by `id:v:level`, and those on their way.
+  const shapes = new Map<string, Shape>();
   const pendingShapes = new Set<string>();
   let tapTimer: ReturnType<typeof setTimeout> | undefined;
   const byId = new Map<number, PotokPlace>();
@@ -221,11 +248,13 @@ export function mountMap(root: HTMLElement) {
     L.tileLayer(config.tiles.url, { maxZoom: config.tiles.max_zoom, attribution: config.tiles.attribution }).addTo(map);
 
     // Areas under the pins, the dimming around the one "only inside" keeps
-    // above them, and its border above that.
+    // above them, its border above that, and routes over all of them, still
+    // under the pins.
     for (const [name, zIndex] of [
       ['pmAreas', '350'],
       ['pmMask', '360'],
       ['pmChosen', '370'],
+      ['pmRoutes', '380'],
     ] as const) {
       map.createPane(name).style.zIndex = zIndex;
     }
@@ -234,21 +263,24 @@ export function mountMap(root: HTMLElement) {
       areas: L.svg({ pane: 'pmAreas', padding: 0.5 }),
       mask: L.svg({ pane: 'pmMask', padding: 0.5 }),
       chosen: L.svg({ pane: 'pmChosen', padding: 0.5 }),
+      routes: L.svg({ pane: 'pmRoutes', padding: 0.5 }),
     };
 
     areaLayer.addTo(map);
     maskLayer.addTo(map);
     chosenLayer.addTo(map);
+    routeLayer.addTo(map);
     markers.addTo(map);
     map.fitBounds(bounds);
 
     map.on('moveend', () => {
-      // A zoom can turn an area from a pin into a border and back.
+      // A zoom can turn an area or a route from a pin into a shape and back.
       const current = shown(state.places, shownOptions());
       if (signature(current) !== shownKey) rebuild(current);
       else drawMarkers();
 
       drawAreas();
+      drawRoutes();
       fetchShapes();
       if (state.panel?.kind === 'view') draw();
     });
@@ -274,10 +306,12 @@ export function mountMap(root: HTMLElement) {
     search: state.search,
   });
 
-  const signature = (current: { borders: PotokPlace[]; pins: PotokPlace[] }) =>
-    `${current.borders.map((place) => place.id).join(',')}|${current.pins.map((place) => place.id).join(',')}`;
+  type Shown = ReturnType<typeof shown>;
 
-  const rebuild = (given?: { borders: PotokPlace[]; pins: PotokPlace[] }) => {
+  const signature = (current: Shown) =>
+    [current.borders, current.lines, current.pins].map((list) => list.map((place) => place.id).join(',')).join('|');
+
+  const rebuild = (given?: Shown) => {
     byId.clear();
     state.places.forEach((place) => byId.set(place.id, place));
 
@@ -287,12 +321,14 @@ export function mountMap(root: HTMLElement) {
 
     const current = given && !changed ? given : shown(state.places, shownOptions());
     borders = current.borders;
+    lines = current.lines;
     pinned = current.pins;
     shownKey = signature(current);
 
     index = buildIndex(pinned, pins(), map?.getMaxZoom() ?? 19);
     drawMarkers();
     drawAreas();
+    drawRoutes();
     fetchShapes();
   };
 
@@ -300,9 +336,9 @@ export function mountMap(root: HTMLElement) {
 
   const shapeKey = (place: PotokPlace, level: number) => `${place.id}:${place.v ?? 0}:${level}`;
 
-  // The border at this zoom's level of detail, or another level of the same
-  // version while that one is on its way.
-  const shapeOf = (place: PotokPlace): Geo | null => {
+  // The border or line at this zoom's level of detail, or another level of
+  // the same version while that one is on its way.
+  const shapeOf = (place: PotokPlace): Shape | null => {
     const level = levelFor(Math.round(map?.getZoom() ?? 0));
     const nearest = [...LEVELS].sort((a, b) => Math.abs(a - level) - Math.abs(b - level));
 
@@ -321,12 +357,25 @@ export function mountMap(root: HTMLElement) {
     return inBox(borders, [box.getWest(), box.getSouth(), box.getEast(), box.getNorth()], MAX_BORDERS);
   };
 
+  // The lines in view, the widest first, at most `MAX_LINES`.
+  const linesInView = (): PotokPlace[] => {
+    if (!map) return [];
+    const box = map.getBounds();
+    return inBox(lines, [box.getWest(), box.getSouth(), box.getEast(), box.getNorth()], MAX_LINES);
+  };
+
+  // An area's border, when the shape kept for it is one.
+  const borderOf = (place: PotokPlace): Geo | null => {
+    const shape = shapeOf(place);
+    return shape?.type === 'MultiPolygon' ? shape : null;
+  };
+
   // The area "only inside" keeps, outlined whatever the zoom and the filters.
   const insideArea = (): PotokPlace | undefined =>
     state.inside === null ? undefined : byId.get(state.inside);
 
   const fetchShapes = () => {
-    const wanted = [...bordersInView(), ...(insideArea()?.bbox ? [insideArea()!] : [])];
+    const wanted = [...bordersInView(), ...linesInView(), ...(insideArea()?.bbox ? [insideArea()!] : [])];
     if (!map || wanted.length === 0) return;
 
     const zoom = Math.round(map.getZoom());
@@ -350,6 +399,7 @@ export function mountMap(root: HTMLElement) {
           if (!reply.ok) return;
           for (const shape of reply.shapes) shapes.set(`${shape.id}:${shape.v}:${reply.level}`, shape.geojson);
           drawAreas();
+          drawRoutes();
         })
         .catch(() => {})
         .finally(() => keys.forEach((key) => pendingShapes.delete(key)));
@@ -368,7 +418,7 @@ export function mountMap(root: HTMLElement) {
     const holes: [number, number][][] = [];
 
     for (const place of bordersInView()) {
-      const geo = shapeOf(place);
+      const geo = borderOf(place);
       const color = lookOf(place, pins()).color;
 
       if (geo && place.bbox) {
@@ -390,7 +440,7 @@ export function mountMap(root: HTMLElement) {
     }
 
     const inside = insideArea();
-    const insideGeo = inside ? shapeOf(inside) : null;
+    const insideGeo = inside ? borderOf(inside) : null;
 
     if (inside && insideGeo) {
       holes.push(...outerRings(insideGeo));
@@ -415,12 +465,67 @@ export function mountMap(root: HTMLElement) {
     }
   };
 
+  // The lines of the routes in view: a casing, the line in the tone of the
+  // route's pin, a wider line nobody sees that takes a tap, and a ring at its
+  // end (none for a loop). A tap opens the group, as its pin does.
+  const drawRoutes = () => {
+    if (!map || !renderers || !state.config) return;
+
+    routeLayer.clearLayers();
+    routePaths.clear();
+    const renderer = renderers.routes;
+
+    for (const place of linesInView()) {
+      const shape = shapeOf(place);
+      if (shape?.type !== 'MultiLineString') continue;
+
+      const parts = lineLatLngs(shape);
+      if (parts.length === 0) continue;
+
+      const color = lookOf(place, pins()).color;
+      const common = { renderer, lineCap: 'round' as const, lineJoin: 'round' as const };
+
+      L.polyline(parts, { ...common, color: '#ffffff', weight: 6.5, interactive: false, className: 'pm-route-casing' }).addTo(
+        routeLayer,
+      );
+
+      const line = L.polyline(parts, {
+        ...common,
+        color,
+        weight: 3.5,
+        interactive: false,
+        className: state.selected === place.id ? 'pm-route is-selected' : 'pm-route',
+      }).addTo(routeLayer);
+
+      L.polyline(parts, { ...common, color, opacity: 0, weight: 18, bubblingMouseEvents: false, className: 'pm-route-hit' })
+        .on('click', () => void select(place))
+        .addTo(routeLayer);
+
+      const end = lineEnd(parts);
+
+      if (end) {
+        L.circleMarker(end, {
+          renderer,
+          radius: 4.5,
+          color,
+          weight: 2.5,
+          fillColor: '#ffffff',
+          fillOpacity: 1,
+          interactive: false,
+          className: 'pm-route-end',
+        }).addTo(routeLayer);
+      }
+
+      routePaths.set(place.id, line);
+    }
+  };
+
   // A tap off the pins: the areas drawn there, smallest first.
   const tapAt = (latlng: L.LatLng) => {
     if (!state.layers.areas || state.adding) return;
 
     const drawn = bordersInView().flatMap((place) => {
-      const geo = shapeOf(place);
+      const geo = borderOf(place);
       return geo ? [{ id: place.id, geo }] : [];
     });
 
@@ -453,12 +558,17 @@ export function mountMap(root: HTMLElement) {
     }
   };
 
-  // The pin of the group open on the page stands out and on top.
+  // The pin of the group open on the page stands out and on top, and so does
+  // its line for a route.
   const markSelected = () => {
     for (const [id, marker] of pinMarkers) {
       const selected = state.selected === id;
       marker.getElement()?.classList.toggle('is-selected', selected);
       marker.setZIndexOffset(selected ? 1000 : 0);
+    }
+
+    for (const [id, line] of routePaths) {
+      line.getElement()?.classList.toggle('is-selected', state.selected === id);
     }
   };
 
@@ -591,11 +701,13 @@ export function mountMap(root: HTMLElement) {
     void select(place);
   };
 
-  // Everything the chips, the search and "only inside" keep: areas whole,
-  // pins where they stand.
+  // Everything the chips, the search and "only inside" keep: areas and
+  // routes whole, pins where they stand.
   const fitAll = () => {
     const corners: [number, number][] = kept(state.places, shownOptions()).flatMap((place) => {
-      if (state.layers.areas && place.bbox) {
+      const whole = place.shape === 'area' ? state.layers.areas : place.shape === 'route' && state.layers.routes;
+
+      if (whole && place.bbox) {
         const [west, south, east, north] = place.bbox;
         return [
           [south, west],
@@ -756,6 +868,7 @@ export function mountMap(root: HTMLElement) {
     const config = state.config!;
     const kinds = kindsOnMap(state.places, config.pins);
     const hasAreas = state.places.some((place) => place.shape === 'area');
+    const hasRoutes = state.places.some((place) => place.shape === 'route');
     const insidePlace = state.inside === null ? undefined : byId.get(state.inside);
 
     return html`
@@ -791,18 +904,21 @@ export function mountMap(root: HTMLElement) {
           () => set({ panel: state.panel?.kind === 'view' ? null : { kind: 'view' }, menu: false }),
           state.panel?.kind === 'view',
         )}
-        ${hasAreas
+        ${hasAreas || hasRoutes
           ? roundButton(
               'layers',
               t('layers'),
               () => set({ layerMenu: !state.layerMenu, menu: false }),
-              state.layerMenu || !state.layers.places || !state.layers.areas,
+              state.layerMenu ||
+                !state.layers.places ||
+                (hasAreas && !state.layers.areas) ||
+                (hasRoutes && !state.layers.routes),
             )
           : nothing}
         ${config.can_edit_view
           ? roundButton('bookmark', t('startView'), () => set({ menu: !state.menu, layerMenu: false }), state.menu)
           : nothing}
-        ${state.menu ? viewMenu() : nothing} ${state.layerMenu ? layerMenu() : nothing}
+        ${state.menu ? viewMenu() : nothing} ${state.layerMenu ? layerMenu(hasAreas, hasRoutes) : nothing}
       </div>
       ${state.panel ? panel(state.panel) : nothing}
       ${state.here && !state.adding && !state.panel ? hereCard(state.here) : nothing}
@@ -873,9 +989,10 @@ export function mountMap(root: HTMLElement) {
     ${icon(name, 'size-5')}
   </button>`;
 
-  const layerMenu = () => html`<div class="pm-menu" role="menu" aria-label=${t('layers')}>
+  const layerMenu = (areas: boolean, routes: boolean) => html`<div class="pm-menu" role="menu" aria-label=${t('layers')}>
     ${layerItem('places', 'pin', t('layerPlaces'), t('layerPlacesHint'))}
-    ${layerItem('areas', 'area', t('layerAreas'), t('layerAreasHint'))}
+    ${areas ? layerItem('areas', 'area', t('layerAreas'), t('layerAreasHint')) : nothing}
+    ${routes ? layerItem('routes', 'route', t('layerRoutes'), t('layerRoutesHint')) : nothing}
   </div>`;
 
   const layerItem = (key: keyof Layers, name: IconName, title: string, hint: string) => {
@@ -992,7 +1109,13 @@ export function mountMap(root: HTMLElement) {
   const placeRow = (place: PotokPlace) => {
     const kind = pins().kinds.find((row) => row.key === place.kind);
     const holder = place.areas.length > 0 ? byId.get(place.areas[0]) : undefined;
-    const what = place.shape === 'area' ? t('area') : (kind?.title ?? '');
+    const what =
+      place.shape === 'area'
+        ? t('area')
+        : place.shape === 'route'
+          ? `${t('route')}${place.length ? ` · ${distance(place.length, lang)}` : ''}`
+          : (kind?.title ?? '');
+    const where = holder ? t(place.shape === 'route' ? 'through' : 'inArea', { n: holder.name }) : '';
 
     return html`<li>
       <button
@@ -1004,7 +1127,7 @@ export function mountMap(root: HTMLElement) {
         <span class="min-w-0 flex-1">
           <span class="block truncate font-medium">${place.name}</span>
           <span class="block truncate text-xs opacity-65">
-            ${what}${holder ? ` · ${t('inArea', { n: holder.name })}` : ''}${place.is_public ? '' : ` · ${t('closed')}`}
+            ${what}${where ? ` · ${where}` : ''}${place.is_public ? '' : ` · ${t('closed')}`}
           </span>
         </span>
       </button>

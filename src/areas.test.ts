@@ -1,5 +1,20 @@
 import { describe, expect, it } from 'vitest';
-import { areasAt, contains, inBox, isDrawn, levelFor, outerRings, shapeArea, shown, spanPx, type Geo } from './areas';
+import {
+  areasAt,
+  contains,
+  distance,
+  inBox,
+  isDrawn,
+  isLine,
+  levelFor,
+  lineEnd,
+  lineLatLngs,
+  outerRings,
+  shapeArea,
+  shown,
+  spanPx,
+  type Geo,
+} from './areas';
 import type { PotokPlace } from './potok';
 
 const square = (lat: number, lng: number, half: number): [number, number][] => [
@@ -56,7 +71,7 @@ describe('what the map shows', () => {
   const shop = point(1, 'chat', [11, 10]);
   const poll = point(2, 'polls', []);
   const places = [shop, poll, quarter, city];
-  const layers = { places: true, areas: true };
+  const layers = { places: true, areas: true, routes: true };
 
   it('borders of the wide areas, biggest first; every place a pin, areas too', () => {
     const { borders, pins } = shown(places, { layers, kind: null, inside: null, zoom: 10 });
@@ -83,7 +98,7 @@ describe('what the map shows', () => {
   });
 
   it('with places off, only the areas', () => {
-    const off = shown(places, { layers: { places: false, areas: true }, kind: null, inside: null, zoom: 8 });
+    const off = shown(places, { layers: { places: false, areas: true, routes: false }, kind: null, inside: null, zoom: 8 });
     expect(off.borders.map((place) => place.id)).toEqual([10]);
     expect(off.pins.map((place) => place.id)).toEqual([11, 10]);
   });
@@ -96,7 +111,7 @@ describe('what the map shows', () => {
   });
 
   it('with areas off, every place is a pin by the chips', () => {
-    const { borders, pins } = shown(places, { layers: { places: true, areas: false }, kind: null, inside: null, zoom: 10 });
+    const { borders, pins } = shown(places, { layers: { places: true, areas: false, routes: true }, kind: null, inside: null, zoom: 10 });
     expect(borders).toEqual([]);
     expect(pins.map((place) => place.id)).toEqual([1, 2, 11, 10]);
   });
@@ -139,5 +154,69 @@ describe('a border', () => {
   it('gives its outer rings as holes for the dimming', () => {
     expect(outerRings(holed)).toHaveLength(2);
     expect(outerRings(holed)[0][0]).toEqual([45.15, 19.75]);
+  });
+});
+
+describe('a route', () => {
+  const quarter = area(11, 0.05);
+  // From west of the quarter, through it: it lies in the quarter by its line.
+  const walk: PotokPlace = {
+    ...point(30, 'chat', [11]),
+    lng: 19.6,
+    shape: 'route',
+    bbox: [19.6, 45.25, 19.95, 45.26],
+    v: 1,
+    length: 27_400,
+  };
+  const shop = point(1, 'chat', [11]);
+  const places = [shop, quarter, walk];
+  const layers = { places: true, areas: true, routes: true };
+
+  it('is a line once 64 pixels wide, a pin before that', () => {
+    // 0.35 degrees: 63.7 px at zoom 8, 127 px at zoom 9.
+    expect(isLine(walk, 8)).toBe(false);
+    expect(isLine(walk, 9)).toBe(true);
+    expect(isLine(quarter, 12)).toBe(false);
+
+    const far = shown(places, { layers, kind: null, inside: null, zoom: 7 });
+    expect(far.lines).toEqual([]);
+    expect(far.pins.map((place) => place.id)).toEqual([1, 11, 30]);
+
+    const near = shown(places, { layers, kind: null, inside: null, zoom: 12 });
+    expect(near.lines.map((place) => place.id)).toEqual([30]);
+    expect(near.pins.map((place) => place.id)).toContain(30);
+  });
+
+  it('has a layer of its own, and without places the shapes whose layer is on', () => {
+    expect(shown(places, { layers: { ...layers, routes: false }, kind: null, inside: null, zoom: 12 }).lines).toEqual([]);
+
+    const onlyRoutes = shown(places, { layers: { places: false, areas: false, routes: true }, kind: null, inside: null, zoom: 12 });
+    expect(onlyRoutes.pins.map((place) => place.id)).toEqual([30]);
+
+    const shapes = shown(places, { layers: { places: false, areas: true, routes: true }, kind: null, inside: null, zoom: 12 });
+    expect(shapes.pins.map((place) => place.id)).toEqual([11, 30]);
+  });
+
+  it('stays "only inside" an area it passes through', () => {
+    const { lines, pins } = shown(places, { layers, kind: null, inside: 11, zoom: 12 });
+    expect(pins.map((place) => place.id)).toEqual([1, 30]);
+    expect(lines.map((place) => place.id)).toEqual([30]);
+  });
+
+  it('gives its parts to Leaflet and its end, none for a loop', () => {
+    const parts = lineLatLngs({ type: 'MultiLineString', coordinates: [[[19.8, 45.2], [19.9, 45.3]], [[20.0, 45.4]]] });
+    expect(parts).toEqual([[[45.2, 19.8], [45.3, 19.9]]]);
+    expect(lineEnd(parts)).toEqual([45.3, 19.9]);
+
+    const loop = lineLatLngs({ type: 'MultiLineString', coordinates: [[[19.8, 45.2], [19.9, 45.3], [19.8, 45.2]]] });
+    expect(lineEnd(loop)).toBeNull();
+  });
+
+  it('says its length as a person reads it', () => {
+    expect(distance(847, 'sr')).toBe('850 m');
+    expect(distance(1_349, 'sr')).toBe('1,3 km');
+    expect(distance(1_349, 'sr-Cyrl')).toBe('1,3 km');
+    expect(distance(1_349, 'en')).toBe('1.3 km');
+    expect(distance(27_400, 'en')).toBe('27 km');
   });
 });

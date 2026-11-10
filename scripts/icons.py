@@ -31,7 +31,9 @@ OUTLINE = {
     "layers": "square-3-stack-3d",
     "area": "viewfinder-circle",
     "zoomIn": "magnifying-glass-plus",
+    "search": "magnifying-glass",
     "open": "arrow-top-right-on-square",
+    "route": "arrow-turn-up-right",
 }
 
 # Kept by the bundler as a legal comment, so the build carries it too.
