@@ -47,6 +47,12 @@ body {
   font-size: 10px;
 }
 
+/* Above an open sheet or list on a phone (`liftControls` in app.ts). */
+.pm-map .leaflet-bottom {
+  bottom: var(--pm-cover, 0px);
+  transition: bottom 200ms ease-out;
+}
+
 /* The light OpenStreetMap tiles, turned dark in the dark theme. */
 :where([data-theme="dark"]) .pm-map .leaflet-tile-pane {
   filter: invert(1) hue-rotate(180deg) brightness(0.9) contrast(0.9);
@@ -689,6 +695,7 @@ body {
   .pm-aim,
   .pm-pin.is-draft svg,
   .pm-map .pm-area,
+  .pm-map .leaflet-bottom,
   .pm-switch,
   .pm-switch::after {
     animation: none;

@@ -1009,6 +1009,16 @@ export function mountMap(root: HTMLElement) {
 
   function draw() {
     render(view(), overlay);
+    liftControls();
+  }
+
+  // On a phone an open sheet or list covers the bottom of the map: Leaflet's
+  // zoom buttons and the map's attribution move up above it. On a wider
+  // frame the list stands at the side and a sheet in the middle.
+  function liftControls() {
+    const cover = overlay.querySelector<HTMLElement>('.pm-sheet, .pm-panel');
+    const narrow = window.matchMedia('(max-width: 639.98px)').matches;
+    mapEl.style.setProperty('--pm-cover', cover && narrow ? `${cover.offsetHeight}px` : '0px');
   }
 
   // --- Live ---
@@ -1035,7 +1045,10 @@ export function mountMap(root: HTMLElement) {
   });
 
   // Leaflet measures its box once; the frame can change size with the page.
-  new ResizeObserver(() => map?.invalidateSize()).observe(mapEl);
+  new ResizeObserver(() => {
+    map?.invalidateSize();
+    liftControls();
+  }).observe(mapEl);
 
   draw();
   void load();
