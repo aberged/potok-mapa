@@ -1,9 +1,14 @@
 import Supercluster from 'supercluster';
-import type { PotokMapConfig, PotokPinPath, PotokPlace } from './potok';
+import type { PotokMapConfig, PotokPinCount, PotokPinPath, PotokPlace, PotokPlaceCluster } from './potok';
 
 // What the map knows apart from Leaflet: how each place looks, how places
 // gather into clusters, and which of them are in view. Kept free of the DOM,
 // so it is tested on its own (places.test.ts).
+//
+// A big map (`listPlaces` in `mode: "view"`) is gathered by Potok into cells
+// of a fixed grid; `mergeMarkers` joins what still stands too close on the
+// screen, `clusterAction` says what a tap on a cluster does, and `syncKeyed`
+// keeps the markers that show the same from one reply to the next.
 
 export type Pins = PotokMapConfig['pins'];
 export type Bounds = [[number, number], [number, number]];
@@ -161,4 +166,291 @@ export function savedBounds(data: unknown): Bounds | null {
   );
 
   return corners[0] && corners[1] ? [corners[0], corners[1]] : null;
+}
+
+// --- Pins: the filter and the legend ---
+
+/**
+ * What the pin filter sees a place as, as Potok does: the icon it picked
+ * while the catalogue has it, "picture", or "kind" for a place that shows its
+ * kind (no icon, or one the catalogue no longer has).
+ */
+export function pinKeyOf(place: Pick<PotokPlace, 'pin'>, icons: ReadonlySet<string>): string {
+  if (place.pin === 'picture') return 'picture';
+  return place.pin !== null && icons.has(place.pin) ? place.pin : 'kind';
+}
+
+/** The keys of the icons in the catalogue. */
+export function iconKeys(pins: Pins): Set<string> {
+  return new Set(pins.icons.map((icon) => icon.key));
+}
+
+/** How many places show each pin (`pinKeyOf`), the most shown first, as Potok counts them. */
+export function pinCounts(places: Pick<PotokPlace, 'pin'>[], pins: Pins): PotokPinCount[] {
+  const icons = iconKeys(pins);
+  const counts = new Map<string, number>();
+
+  for (const place of places) {
+    const key = pinKeyOf(place, icons);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+
+  return [...counts]
+    .map(([pin, count]) => ({ pin, count }))
+    .sort((a, b) => b.count - a.count || a.pin.localeCompare(b.pin));
+}
+
+/** What a map's editors call its pins (`config.data.legend`): pin key → name. */
+export type Legend = Record<string, string>;
+
+/** The most a legend's name holds. */
+export const LEGEND_MAX = 40;
+
+/**
+ * The legend in a map's config: names people typed, kept as they are apart
+ * from the spaces around them, never transliterated. Anything else is left out.
+ */
+export function legendOf(data: unknown): Legend {
+  const raw = (data as { legend?: unknown } | null)?.legend;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+
+  return Object.fromEntries(
+    Object.entries(raw).flatMap(([key, value]) =>
+      typeof value === 'string' && value.trim() !== '' ? [[key, value.trim()]] : [],
+    ),
+  );
+}
+
+/** One chip of the pin filter, or one row of the legend's form. */
+export type PinOption = {
+  key: string;
+  /** The legend's name for it, or the icon's title. */
+  title: string;
+  /** The icon's title, or the app's word for "kind" and "picture". */
+  fallback: string;
+  count: number;
+  look: Look;
+};
+
+/**
+ * The pins on a map as chips: those `counts` has, and those picked even when
+ * none is left, so a pick can always be undone; the most shown first, then in
+ * the catalogue's order. A pin the catalogue does not know is left out.
+ */
+export function pinOptions(
+  counts: PotokPinCount[],
+  pins: Pins,
+  legend: Legend,
+  words: { kind: string; picture: string },
+  picked: readonly string[] = [],
+): PinOption[] {
+  const rows = new Map<string, number>();
+  for (const { pin, count } of counts) if (count > 0) rows.set(pin, (rows.get(pin) ?? 0) + count);
+  for (const key of picked) if (!rows.has(key)) rows.set(key, 0);
+
+  const order = (key: string) => {
+    const index = pins.icons.findIndex((icon) => icon.key === key);
+    return index >= 0 ? index : key === 'picture' ? pins.icons.length : pins.icons.length + 1;
+  };
+
+  return [...rows]
+    .flatMap(([key, count]) => {
+      const icon = pins.icons.find((row) => row.key === key);
+      const fallback = icon?.title ?? (key === 'kind' ? words.kind : key === 'picture' ? words.picture : null);
+      if (fallback === null) return [];
+
+      const look = lookOf({ kind: 'none', pin: icon ? key : null, picture_url: null }, pins);
+      const named = Object.hasOwn(legend, key) ? legend[key] : undefined;
+      return [{ key, title: named ?? fallback, fallback, count, look }];
+    })
+    .sort((a, b) => b.count - a.count || order(a.key) - order(b.key));
+}
+
+/** A pick of the pin filter turned on or off. */
+export function togglePin(picked: readonly string[], key: string): string[] {
+  return picked.includes(key) ? picked.filter((row) => row !== key) : [...picked, key];
+}
+
+// --- A big map's view ---
+
+/**
+ * The view's box as `listPlaces` takes it, [west, south, east, north]:
+ * longitudes wrapped into -180..180 (west east of east across the
+ * antimeridian), the whole world for a view wider than it.
+ */
+export function viewBox(west: number, south: number, east: number, north: number): [number, number, number, number] {
+  const clampLat = (lat: number) => Math.max(-90, Math.min(90, lat));
+  const [low, high] = [clampLat(Math.min(south, north)), clampLat(Math.max(south, north))];
+
+  if (east - west >= 360) return [-180, low, 180, high];
+  return [wrapLng(west), low, wrapLng(east), high];
+}
+
+function wrapLng(lng: number): number {
+  const wrapped = lng - 360 * Math.floor((lng + 180) / 360);
+  // 180 itself wraps to -180; an east edge there means the antimeridian.
+  return wrapped === -180 && lng > 0 ? 180 : wrapped;
+}
+
+export type Point = { x: number; y: number };
+/** Where a point stands on the screen, in pixels. */
+export type Project = (lat: number, lng: number) => Point;
+
+/** Markers closer than their half sizes and this much more become one, as on Potok's map. */
+export const MERGE_GAP = 8;
+const PIN_HEIGHT = 40;
+const PIN_TIP = 39;
+
+type Item = PotokPlaceCluster & { size: number; point: Point; place?: PotokPlace };
+
+/**
+ * Potok's cells are a fixed grid, so the markers of neighbouring cells can
+ * stand closer than they are wide. Those that would cover or touch each other
+ * become one cluster, the biggest first, as on Potok's map: its count the sum,
+ * its tones added up, its position their average by count, its bounds around
+ * them all. A pin stands on its tip, so it counts from half its height up.
+ */
+export function mergeMarkers(
+  places: PotokPlace[],
+  clusters: PotokPlaceCluster[],
+  project: Project,
+  pins: Pins,
+): { places: PotokPlace[]; clusters: PotokPlaceCluster[] } {
+  const items: Item[] = [
+    ...clusters.map((cluster) => ({
+      ...cluster,
+      tones: cluster.tones ?? {},
+      size: clusterSize(cluster.count),
+      point: project(cluster.lat, cluster.lng),
+    })),
+    ...places.map((place) => {
+      const point = project(place.lat, place.lng);
+      return {
+        count: 1,
+        lat: place.lat,
+        lng: place.lng,
+        bounds: [
+          [place.lat, place.lng],
+          [place.lat, place.lng],
+        ] as Bounds,
+        tones: { [lookOf(place, pins).tone]: 1 },
+        size: PIN_HEIGHT,
+        point: { x: point.x, y: point.y - PIN_TIP / 2 },
+        place,
+      };
+    }),
+  ].sort((a, b) => b.count - a.count);
+
+  const taken = new Set<number>();
+  const single: PotokPlace[] = [];
+  const gathered: PotokPlaceCluster[] = [];
+
+  items.forEach((base, index) => {
+    if (taken.has(index)) return;
+
+    const near = [base];
+
+    for (let other = index + 1; other < items.length; other++) {
+      const item = items[other];
+      const apart = Math.hypot(base.point.x - item.point.x, base.point.y - item.point.y);
+
+      if (!taken.has(other) && apart < (base.size + item.size) / 2 + MERGE_GAP) {
+        near.push(item);
+        taken.add(other);
+      }
+    }
+
+    if (near.length === 1) {
+      if (base.place) single.push(base.place);
+      else gathered.push({ count: base.count, lat: base.lat, lng: base.lng, bounds: base.bounds, tones: base.tones });
+      return;
+    }
+
+    const count = near.reduce((sum, item) => sum + item.count, 0);
+    const tones: Record<string, number> = {};
+    for (const item of near) {
+      for (const [tone, n] of Object.entries(item.tones)) tones[tone] = (tones[tone] ?? 0) + n;
+    }
+
+    gathered.push({
+      count,
+      lat: near.reduce((sum, item) => sum + item.lat * item.count, 0) / count,
+      lng: near.reduce((sum, item) => sum + item.lng * item.count, 0) / count,
+      bounds: [
+        [Math.min(...near.map((item) => item.bounds[0][0])), Math.min(...near.map((item) => item.bounds[0][1]))],
+        [Math.max(...near.map((item) => item.bounds[1][0])), Math.max(...near.map((item) => item.bounds[1][1]))],
+      ],
+      tones,
+    });
+  });
+
+  return { places: single, clusters: gathered };
+}
+
+/** How far apart, in pixels, the places of a cluster could stand at most at `zoom` (Web Mercator). */
+export function spreadPx(bounds: Bounds, zoom: number): number {
+  const scale = 256 * 2 ** zoom;
+  const y = (lat: number) => {
+    const rad = (Math.max(-85.0511287798, Math.min(85.0511287798, lat)) * Math.PI) / 180;
+    return ((1 - Math.log(Math.tan(rad) + 1 / Math.cos(rad)) / Math.PI) / 2) * scale;
+  };
+  const [[south, west], [north, east]] = bounds;
+  return Math.hypot(((east - west) / 360) * scale, y(south) - y(north));
+}
+
+/**
+ * What a tap on a big map's cluster does: zoom in, to the box around its
+ * places (with a margin) and at least a level, or list its places when it
+ * would never spread: they stand at one point, the map is at its last zoom,
+ * or they lie so close that they would still touch there.
+ */
+export function clusterAction(
+  bounds: Bounds,
+  zoom: number,
+  maxZoom: number,
+  fitZoom: number,
+): { list: true } | { list: false; zoom: number } {
+  const [[south, west], [north, east]] = bounds;
+  const onePoint = south === north && west === east;
+
+  if (onePoint || zoom >= maxZoom || spreadPx(bounds, maxZoom) < PIN_HEIGHT + MERGE_GAP) return { list: true };
+  return { list: false, zoom: Math.min(maxZoom, Math.max(fitZoom, Math.floor(zoom) + 1)) };
+}
+
+/** What a pin shows, so that a marker showing the same stays on the map. */
+export function placeKey(place: PotokPlace): string {
+  return ['p', place.id, place.lat, place.lng, place.pin, place.kind, place.is_public, place.picture_url, place.name].join(
+    ':',
+  );
+}
+
+/** What a cluster shows: where, how many and its ring. */
+export function clusterKey(cluster: PotokPlaceCluster, ring: string): string {
+  return ['c', cluster.lat, cluster.lng, cluster.count, ring].join(':');
+}
+
+/**
+ * Keeps the items of `drawn` (key → item) whose key `next` (key → make) still
+ * has, takes the others away and makes the new ones: a marker that shows the
+ * same is not drawn again.
+ */
+export function syncKeyed<T>(
+  drawn: Map<string, T>,
+  next: Map<string, () => T>,
+  add: (item: T) => void,
+  remove: (item: T) => void,
+): void {
+  for (const [key, item] of drawn) {
+    if (!next.has(key)) {
+      remove(item);
+      drawn.delete(key);
+    }
+  }
+
+  for (const [key, make] of next) {
+    if (drawn.has(key)) continue;
+    const item = make();
+    add(item);
+    drawn.set(key, item);
+  }
 }

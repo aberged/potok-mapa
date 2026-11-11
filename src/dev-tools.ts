@@ -13,10 +13,20 @@ import type { PotokMapConfig, PotokPlace } from './potok';
 // `potok-dev:place-shapes` and the areas of every place worked out here, as
 // Potok works them out (a route by its points, near enough). To start over:
 // localStorage.removeItem('potok-dev:places').
+//
+// `?seed=big` adds 5000 traffic accidents across Serbia, too many for one
+// reply, so the mock gathers the map's view as Potok does (`mode: "view"`).
+// Their pins say what happened, as the import of the police's records sets
+// them: `problem` for the killed, `warning` for the injured and `transport`
+// for damage only, and some stand at one spot. `?seed=small` goes back.
 
 const PLACES_STORAGE_KEY = 'potok-dev:places';
 const SHAPES_STORAGE_KEY = 'potok-dev:place-shapes';
 const CONFIG_STORAGE_KEY = 'potok-dev:map-config';
+// Past this many places Potok gathers a map's view.
+const ALL_PLACES = 2_000;
+const ACCIDENTS = 5_000;
+const FIRST_ACCIDENT_ID = 10_000;
 
 type Seed = [name: string, lat: number, lng: number, kind: string, pin?: string | null, closed?: boolean];
 
@@ -178,6 +188,122 @@ const places: PotokPlace[] = [...points, ...areaPlaces, ...routePlaces].map((pla
   return { ...place, areas: holders };
 });
 
+// --- `?seed=big`: a map too big for one reply ---
+
+// Towns, and how many of the accidents happen around each, roughly.
+const towns: [name: string, lat: number, lng: number, weight: number][] = [
+  ['Beograd', 44.8125, 20.4612, 30],
+  ['Novi Sad', 45.2671, 19.8335, 10],
+  ['Niš', 43.3209, 21.8958, 7],
+  ['Kragujevac', 44.0128, 20.9114, 5],
+  ['Subotica', 46.1, 19.6658, 4],
+  ['Zrenjanin', 45.3816, 20.3686, 3],
+  ['Pančevo', 44.8708, 20.6403, 3],
+  ['Čačak', 43.8914, 20.3497, 3],
+  ['Kraljevo', 43.7258, 20.6894, 3],
+  ['Smederevo', 44.6628, 20.93, 2],
+  ['Leskovac', 42.9981, 21.9461, 2],
+  ['Valjevo', 44.2751, 19.8982, 2],
+  ['Kruševac', 43.58, 21.3339, 2],
+  ['Vranje', 42.5514, 21.9003, 2],
+  ['Šabac', 44.7489, 19.6908, 2],
+  ['Užice', 43.8586, 19.8488, 2],
+  ['Sombor', 45.7742, 19.1122, 2],
+  ['Požarevac', 44.6213, 21.1878, 2],
+  ['Pirot', 43.1531, 22.5861, 1],
+  ['Zaječar', 43.9036, 22.2847, 1],
+  ['Kikinda', 45.8297, 20.4653, 1],
+  ['Sremska Mitrovica', 44.9764, 19.6122, 1],
+  ['Jagodina', 43.9771, 21.2612, 1],
+  ['Vršac', 45.1167, 21.3036, 1],
+  ['Novi Pazar', 43.1367, 20.5122, 2],
+  ['Loznica', 44.5333, 19.2258, 1],
+  ['Barajevo', 44.58, 20.4167, 1],
+];
+
+// The same accidents on every reload: a small seeded random (mulberry32).
+function seeded(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4_294_967_296;
+  };
+}
+
+const two = (n: number) => String(n).padStart(2, '0');
+const round6 = (value: number) => Math.round(value * 1e6) / 1e6;
+
+// Most around the middle of a town, some along its roads further out, and
+// one in sixteen where another one happened already.
+function accidents(): PotokPlace[] {
+  const random = seeded(2025);
+  const weights = towns.reduce((sum, [, , , weight]) => sum + weight, 0);
+  const normal = () => Math.sqrt(-2 * Math.log(Math.max(random(), 1e-9))) * Math.cos(2 * Math.PI * random());
+  const pick = () => {
+    let left = random() * weights;
+    return towns.find(([, , , weight]) => (left -= weight) <= 0) ?? towns[0];
+  };
+
+  const made: { place: PotokPlace; town: string }[] = [];
+
+  for (let i = 0; i < ACCIDENTS; i++) {
+    const roll = random();
+    const [pin, what] = roll < 0.02 ? ['problem', 'Poginuli'] : roll < 0.4 ? ['warning', 'Povređeni'] : ['transport', 'Materijalna šteta'];
+    let [town, lat, lng] = pick();
+
+    if (made.length > 0 && random() < 1 / 16) {
+      const twin = made[Math.floor(random() * made.length)];
+      [town, lat, lng] = [twin.town, twin.place.lat, twin.place.lng];
+    } else {
+      const spread = random() < 0.8 ? 0.03 : 0.12;
+      [lat, lng] = [round6(lat + normal() * spread), round6(lng + normal() * spread * 1.4)];
+    }
+
+    const when = new Date(Date.UTC(2025, 0, 1 + Math.floor(random() * 365), Math.floor(random() * 24), Math.floor(random() * 60)));
+    const date = `${two(when.getUTCDate())}.${two(when.getUTCMonth() + 1)}.${when.getUTCFullYear()}.`;
+    const time = `${two(when.getUTCHours())}:${two(when.getUTCMinutes())}`;
+
+    made.push({
+      town,
+      place: {
+        id: FIRST_ACCIDENT_ID + i,
+        name: `${what} · ${town} · ${date} ${time}`,
+        lat,
+        lng,
+        kind: 'none',
+        pin,
+        picture_url: null,
+        is_public: true,
+        shape: 'point',
+        areas: [],
+      },
+    });
+  }
+
+  return made.map(({ place }) => place);
+}
+
+function storedCount(): number {
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(PLACES_STORAGE_KEY) || '[]');
+    return Array.isArray(stored) ? stored.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function store(seed: PotokPlace[]) {
+  try {
+    localStorage.setItem(PLACES_STORAGE_KEY, JSON.stringify(seed));
+    localStorage.setItem(SHAPES_STORAGE_KEY, JSON.stringify({ ...Object.fromEntries(geoOf), ...Object.fromEntries(lineOf) }));
+  } catch {
+    console.warn('[potok-dev] The seeded places do not fit in localStorage.');
+  }
+}
+
 export function seedDevMap() {
   const params = new URLSearchParams(location.search);
   const lang = params.get('lang');
@@ -193,8 +319,10 @@ export function seedDevMap() {
 
   localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(config));
 
-  if (!localStorage.getItem(PLACES_STORAGE_KEY)) {
-    localStorage.setItem(PLACES_STORAGE_KEY, JSON.stringify(places));
-    localStorage.setItem(SHAPES_STORAGE_KEY, JSON.stringify({ ...Object.fromEntries(geoOf), ...Object.fromEntries(lineOf) }));
-  }
+  const seed = params.get('seed');
+  const big = storedCount() > ALL_PLACES;
+
+  if (seed === 'big' && !big) store([...places, ...accidents()]);
+  else if (seed === 'small' && big) store(places);
+  else if (!localStorage.getItem(PLACES_STORAGE_KEY)) store(places);
 }

@@ -34,6 +34,7 @@ OUTLINE = {
     "search": "magnifying-glass",
     "open": "arrow-top-right-on-square",
     "route": "arrow-turn-up-right",
+    "legend": "tag",
 }
 
 # Kept by the bundler as a legal comment, so the build carries it too.

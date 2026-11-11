@@ -4,17 +4,31 @@ import { keys, translator } from './i18n';
 import { clusterHtml, escapeAttribute, pinSvg } from './pins';
 import {
   buildIndex,
+  clusterAction,
+  clusterKey,
   clusterSize,
+  iconKeys,
   inView,
   kindsOnMap,
+  legendOf,
   lookOf,
+  mergeMarkers,
   ofKind,
+  pinCounts,
+  pinKeyOf,
+  pinOptions,
+  placeKey,
   ringGradient,
   sameSpot,
   savedBounds,
+  spreadPx,
+  syncKeyed,
+  togglePin,
+  viewBox,
   type Pins,
+  type Project,
 } from './places';
-import type { PotokPlace } from './potok';
+import type { PotokPlace, PotokPlaceCluster } from './potok';
 
 const pins = catalogue.pins as Pins;
 
@@ -155,6 +169,229 @@ describe('the places shown', () => {
   });
 });
 
+describe('the pin filter', () => {
+  const icons = iconKeys(pins);
+  const accidents = [
+    place(1, 44.8, 20.4, 'none', 'transport'),
+    place(2, 44.8, 20.4, 'none', 'transport'),
+    place(3, 44.8, 20.4, 'none', 'transport'),
+    place(4, 44.8, 20.4, 'none', 'warning'),
+    place(5, 44.8, 20.4, 'none', 'warning'),
+    place(6, 44.8, 20.4, 'none', 'problem'),
+    place(7, 44.8, 20.4, 'chat', null),
+  ];
+
+  it('sees a place as its icon, "picture", or "kind" for one that shows its kind', () => {
+    expect(pinKeyOf({ pin: 'shop' }, icons)).toBe('shop');
+    expect(pinKeyOf({ pin: 'picture' }, icons)).toBe('picture');
+    expect(pinKeyOf({ pin: null }, icons)).toBe('kind');
+    expect(pinKeyOf({ pin: 'retired' }, icons)).toBe('kind');
+  });
+
+  it('has the warning pin of the injured, in the tone of reports', () => {
+    expect(pins.icons.find((row) => row.key === 'warning')).toMatchObject({ tone: 'reports', title: 'Upozorenje' });
+    expect(lookOf(place(1, 44, 20, 'none', 'warning'), pins).color).toBe(pins.tones.reports);
+  });
+
+  it('counts the places of each pin, the most shown first, as Potok does', () => {
+    expect(pinCounts(accidents, pins)).toEqual([
+      { pin: 'transport', count: 3 },
+      { pin: 'warning', count: 2 },
+      { pin: 'kind', count: 1 },
+      { pin: 'problem', count: 1 },
+    ]);
+  });
+
+  it("names the chips as the legend says, as typed, or by the icon's title", () => {
+    const legend = { problem: 'Poginuli', warning: 'Povređeni', transport: 'Materijalna šteta' };
+    const words = { kind: 'Bez ikonice', picture: 'Slika grupe' };
+    const options = pinOptions(pinCounts(accidents, pins), pins, legend, words);
+
+    // Most first; at one count in the catalogue's order, "kind" after the icons.
+    expect(options.map((option) => [option.key, option.title, option.count])).toEqual([
+      ['transport', 'Materijalna šteta', 3],
+      ['warning', 'Povređeni', 2],
+      ['problem', 'Poginuli', 1],
+      ['kind', 'Bez ikonice', 1],
+    ]);
+    expect(options[0].fallback).toBe(pins.icons.find((row) => row.key === 'transport')!.title);
+    expect(options[0].look.color).toBe(pins.tones.places);
+    expect(pinOptions(pinCounts(accidents, pins), pins, {}, words)[0].title).toBe(options[0].fallback);
+  });
+
+  it('keeps a chip picked with none left, so the pick can be undone, and leaves out pins it does not know', () => {
+    const options = pinOptions(
+      [
+        { pin: 'transport', count: 3 },
+        { pin: 'castle', count: 2 },
+      ],
+      pins,
+      {},
+      { kind: 'Bez ikonice', picture: 'Slika grupe' },
+      ['problem'],
+    );
+
+    expect(options.map((option) => [option.key, option.count])).toEqual([
+      ['transport', 3],
+      ['problem', 0],
+    ]);
+  });
+
+  it('picks and unpicks', () => {
+    expect(togglePin([], 'problem')).toEqual(['problem']);
+    expect(togglePin(['problem', 'warning'], 'problem')).toEqual(['warning']);
+  });
+
+  it('reads the legend from the config, leaving out what is not a name', () => {
+    expect(legendOf({ legend: { problem: '  Poginuli ', warning: '', transport: 3 }, view: {} })).toEqual({
+      problem: 'Poginuli',
+    });
+    expect(legendOf({ legend: ['Poginuli'] })).toEqual({});
+    expect(legendOf(null)).toEqual({});
+  });
+});
+
+describe("a big map's view", () => {
+  // A thousand pixels a degree, north up.
+  const project: Project = (lat, lng) => ({ x: lng * 1000, y: -lat * 1000 });
+  const cluster = (count: number, lat: number, lng: number, tones: Record<string, number>): PotokPlaceCluster => ({
+    count,
+    lat,
+    lng,
+    bounds: [
+      [lat - 0.001, lng - 0.001],
+      [lat + 0.001, lng + 0.001],
+    ],
+    tones,
+  });
+
+  it('asks for the view with longitudes wrapped, and the whole world past its width', () => {
+    expect(viewBox(19, 44, 21, 46)).toEqual([19, 44, 21, 46]);
+    expect(viewBox(-200, 10, 200, 20)).toEqual([-180, 10, 180, 20]);
+    expect(viewBox(170, -10, 190, 10)).toEqual([170, -10, -170, 10]);
+    expect(viewBox(100, -95, 180, 95)).toEqual([100, -90, 180, 90]);
+  });
+
+  it('keeps markers apart as they are', () => {
+    const merged = mergeMarkers([place(1, 44.8, 20.4), place(2, 44.8, 20.5)], [cluster(5, 45, 20.4, { kind: 5 })], project, pins);
+    expect(merged.places.map((row) => row.id)).toEqual([1, 2]);
+    expect(merged.clusters).toEqual([cluster(5, 45, 20.4, { kind: 5 })]);
+  });
+
+  it('joins two pins that would touch into a cluster of both', () => {
+    // 40 px apart: closer than a pin (40) and the gap (8).
+    const merged = mergeMarkers(
+      [place(1, 44.8, 20.4, 'none', 'problem'), place(2, 44.8, 20.44, 'none', 'warning')],
+      [],
+      project,
+      pins,
+    );
+
+    expect(merged.places).toEqual([]);
+    expect(merged.clusters).toHaveLength(1);
+    expect(merged.clusters[0]).toMatchObject({
+      count: 2,
+      tones: { alert: 1, reports: 1 },
+      bounds: [
+        [44.8, 20.4],
+        [44.8, 20.44],
+      ],
+    });
+    expect(merged.clusters[0].lng).toBeCloseTo(20.42, 6);
+  });
+
+  it('lets a cluster take in a pin by it, its place weighed by the counts', () => {
+    // A pin counts from half its height up: 40 px across and 19.5 up is
+    // nearer than the cluster's half (18), the pin's (20) and the gap; 50 is not.
+    const near = mergeMarkers([place(1, 45, 20.44)], [cluster(9, 45, 20.4, { kind: 9 })], project, pins);
+    expect(near.places).toEqual([]);
+    expect(near.clusters[0]).toMatchObject({ count: 10, tones: { kind: 10 } });
+    expect(near.clusters[0].lng).toBeCloseTo(20.404, 6);
+    const [[south, west], [north, east]] = near.clusters[0].bounds;
+    expect([south, west, north, east].map((edge) => Number(edge.toFixed(6)))).toEqual([44.999, 20.399, 45.001, 20.44]);
+
+    const far = mergeMarkers([place(1, 45, 20.45)], [cluster(9, 45, 20.4, { kind: 9 })], project, pins);
+    expect(far.places).toHaveLength(1);
+    expect(far.clusters).toHaveLength(1);
+  });
+
+  it('joins the biggest first', () => {
+    // The 3 joins the 100 beside it; the 50 is too far from the 100 and is
+    // not compared with the 3 that is gone.
+    const merged = mergeMarkers(
+      [],
+      [cluster(3, 45, 20.445, { nature: 3 }), cluster(50, 45, 20.49, { kind: 50 }), cluster(100, 45, 20.4, { kind: 100 })],
+      project,
+      pins,
+    );
+
+    expect(merged.clusters.map((row) => [row.count, row.tones])).toEqual([
+      [103, { kind: 100, nature: 3 }],
+      [50, { kind: 50 }],
+    ]);
+  });
+
+  it('knows how far apart places could stand at a zoom', () => {
+    // A degree of longitude at zoom 0 is 256 / 360 of a pixel.
+    expect(spreadPx([[0, 0], [0, 1]], 0)).toBeCloseTo(256 / 360, 6);
+    expect(spreadPx([[0, 0], [0, 1]], 3)).toBeCloseTo((256 * 8) / 360, 6);
+  });
+
+  it('a tap on a cluster zooms to its places, at least a level', () => {
+    const wide: [[number, number], [number, number]] = [
+      [44, 20],
+      [45, 21],
+    ];
+    expect(clusterAction(wide, 7, 19, 9)).toEqual({ list: false, zoom: 9 });
+    expect(clusterAction(wide, 7, 19, 6)).toEqual({ list: false, zoom: 8 });
+    expect(clusterAction(wide, 18, 19, 22)).toEqual({ list: false, zoom: 19 });
+  });
+
+  it('lists a cluster that would never spread: one point, the last zoom, or too close even there', () => {
+    expect(clusterAction([[44.8, 20.4], [44.8, 20.4]], 7, 19, 19)).toEqual({ list: true });
+    expect(clusterAction([[44, 20], [45, 21]], 19, 19, 19)).toEqual({ list: true });
+    // A millionth of a degree is less than a pixel even at zoom 19.
+    expect(clusterAction([[44.8, 20.4], [44.800001, 20.400001]], 12, 19, 19)).toEqual({ list: true });
+  });
+
+  it('keeps the markers that show the same, takes away the others and makes the new ones', () => {
+    const drawn = new Map([
+      ['a', 'A'],
+      ['b', 'B'],
+    ]);
+    const made: string[] = [];
+    const added: string[] = [];
+    const removed: string[] = [];
+
+    syncKeyed(
+      drawn,
+      new Map([
+        ['b', () => (made.push('b'), 'B2')],
+        ['c', () => (made.push('c'), 'C')],
+      ]),
+      (item) => added.push(item),
+      (item) => removed.push(item),
+    );
+
+    expect([made, added, removed]).toEqual([['c'], ['C'], ['A']]);
+    expect([...drawn]).toEqual([
+      ['b', 'B'],
+      ['c', 'C'],
+    ]);
+  });
+
+  it('keys a marker by what it shows', () => {
+    const pin = place(1, 44.8, 20.4, 'none', 'warning');
+    expect(placeKey(pin)).toBe(placeKey({ ...pin }));
+    expect(placeKey(pin)).not.toBe(placeKey({ ...pin, pin: 'problem' }));
+    expect(placeKey(pin)).not.toBe(placeKey({ ...pin, name: 'Drugo ime' }));
+
+    const gathered = cluster(5, 45, 20.4, { kind: 5 });
+    expect(clusterKey(gathered, 'red')).not.toBe(clusterKey({ ...gathered, count: 6 }, 'red'));
+    expect(clusterKey(gathered, 'red')).not.toBe(clusterKey(gathered, 'blue'));
+  });
+});
+
 describe('the words', () => {
   it('every language has every word, and fills in numbers', () => {
     expect(keys.en).toEqual(keys.sr);
@@ -164,5 +401,11 @@ describe('the words', () => {
     expect(translator('sr-Cyrl')('truncated', { n: 2000 })).toBe('Приказан је само део група: 2000.');
     expect(translator('sr-Cyrl')('inArea', { n: 'Liman' })).toBe('У: Liman');
     expect(translator('en')('addPlace')).toBe('Add a place');
+  });
+
+  it("says what a big map's circles hold", () => {
+    expect(translator('sr')('inClusters', { n: '1.234' })).toBe('+1.234 u krugovima, približi mapu');
+    expect(translator('sr-Cyrl')('inClusters', { n: '1.234' })).toBe('+1.234 у круговима, приближи мапу');
+    expect(translator('en')('inClusters', { n: '1,234' })).toBe('+1,234 in circles, zoom in');
   });
 });

@@ -281,6 +281,11 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* Undoes the pin filter: a chip with only a cross. */
+.pm-chip-clear {
+  padding-inline: 0.4375rem;
+}
+
 .pm-note {
   border-radius: 9999px;
   background: color-mix(in oklab, var(--color-base-100) 94%, transparent);
@@ -574,6 +579,30 @@ body {
 .pm-row-pin {
   display: inline-flex;
   flex-shrink: 0;
+}
+
+/* Under a list: what the circles of a big map hold, or that there is more. */
+.pm-panel-note {
+  padding: 0.25rem 1rem 0.875rem;
+  font-size: 0.8125rem;
+  opacity: 0.7;
+}
+
+/* The legend's form: a name for each pin on the map. */
+.pm-legend {
+  display: flex;
+  max-height: min(18rem, 45vh);
+  flex-direction: column;
+  gap: 0.5rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0.125rem;
+}
+
+.pm-legend-row {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
 }
 
 .pm-input {

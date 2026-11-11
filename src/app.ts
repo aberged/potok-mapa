@@ -22,18 +22,40 @@ import { icon, type IconName } from './icons';
 import { clusterHtml, pinSvg } from './pins';
 import {
   buildIndex,
+  clusterAction,
+  clusterKey,
   clusterSize,
+  iconKeys,
   inView,
   kindsOnMap,
+  LEGEND_MAX,
+  legendOf,
   lookOf,
+  mergeMarkers,
+  pinCounts,
+  pinOptions,
+  placeKey,
   ringGradient,
   sameSpot,
   savedBounds,
+  syncKeyed,
+  togglePin,
+  viewBox,
   type Bounds,
   type Index,
+  type PinOption,
   type Pins,
 } from './places';
-import type { PotokConfig, PotokMapConfig, PotokPlace } from './potok';
+import type {
+  PotokConfig,
+  PotokMapConfig,
+  PotokPinCount,
+  PotokPlace,
+  PotokPlaceCluster,
+  PotokPlacesAll,
+  PotokPlacesQuery,
+  PotokPlacesView,
+} from './potok';
 
 // The map app: the sub-groups of its group that have a place, as pins on a
 // map of Serbia or of the view its editors saved. A tap on a pin opens the
@@ -55,21 +77,53 @@ import type { PotokConfig, PotokMapConfig, PotokPlace } from './potok';
 // the group as a tap on its pin does, and "only inside" keeps a route that
 // passes through the area.
 //
+// A big map, of more than 2000 places, comes gathered by Potok: `listPlaces`
+// with the view answers `mode: "view"`, the places alone in their cells and
+// clusters for the rest. The map asks again for each view it stops at, draws
+// only the newest reply and joins markers that would still touch; the search
+// and the pin filter go to Potok, a cluster that will not spread lists its
+// places (`listPlacesAt`), and areas and routes are only pins. A map of up to
+// 2000 places, or an older Potok, gets all of them and does everything here.
+//
+// The pin filter keeps the places that show the pins picked, and the map's
+// editors can name its pins for this map, as a legend (`config.data.legend`).
+//
 // Leaflet draws the map and the pins; lit-html draws what floats over it.
 
 type Adding =
   | { step: 'aim' }
   | { step: 'form'; lat: number; lng: number; name: string; kind: string; saving: boolean; error: string | null };
 
-type Panel = { kind: 'view' } | { kind: 'spot'; ids: number[] };
+// The places at a spot of a small map (`spot`, by id) or of a big one (`at`,
+// as `listPlacesAt` gave them).
+type Panel =
+  | { kind: 'view' }
+  | { kind: 'spot'; ids: number[] }
+  | { kind: 'at'; places: PotokPlace[]; hasMore: boolean };
 
 type Here = { ids: number[]; selected: number };
+
+// What a big map shows in its view, as the newest reply gave it.
+type View = { places: PotokPlace[]; clusters: PotokPlaceCluster[]; total: number; truncated: boolean };
+
+type LegendForm = { names: Record<string, string>; saving: boolean; error: string | null };
+
+type Wants = { extent?: boolean; counts?: boolean };
 
 type State = {
   status: 'loading' | 'ready' | 'failed' | 'outdated';
   config: PotokMapConfig | null;
+  // `all`: every place is here (`places`); `view`: Potok gathers them (`view`).
+  mode: 'all' | 'view';
   places: PotokPlace[];
   truncated: boolean;
+  view: View | null;
+  // A big map's: how many places the filters keep and the box around them,
+  // and how many show each pin, whatever the filters.
+  extent: { count: number; bounds: Bounds | null } | null;
+  counts: PotokPinCount[];
+  pinFilter: string[];
+  legendForm: LegendForm | null;
   kind: string | null;
   selected: number | null;
   panel: Panel | null;
@@ -99,6 +153,15 @@ const MAX_BORDERS = 300;
 const MAX_LINES = 150;
 // How long a move to a place or an area takes, in seconds, as on Potok's map.
 const FLY_SECONDS = 0.5;
+// A big map asks for its view this long after it stops moving, and after the
+// search stops changing.
+const MOVE_DELAY_MS = 250;
+const SEARCH_DELAY_MS = 300;
+// A big map reads a change at most this often: an import changes it every
+// second or two.
+const VIEW_REFRESH_MS = 10_000;
+// Asked again this long after Potok said there were too many asks.
+const RETRY_MS = 2000;
 // The whole world, around the holes of the area "only inside" keeps.
 const WORLD: [number, number][] = [
   [-89.9, -540],
@@ -121,8 +184,14 @@ export function mountMap(root: HTMLElement) {
   let state: State = {
     status: 'loading',
     config: null,
+    mode: 'all',
     places: [],
     truncated: false,
+    view: null,
+    extent: null,
+    counts: [],
+    pinFilter: [],
+    legendForm: null,
     kind: null,
     selected: null,
     panel: null,
@@ -164,6 +233,24 @@ export function mountMap(root: HTMLElement) {
   const byId = new Map<number, PotokPlace>();
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+  // The catalogue's icons, for the pin filter.
+  let icons: ReadonlySet<string> = new Set();
+  // A big map's markers by what they show (`placeKey`, `clusterKey`), and
+  // what they show after `mergeMarkers`.
+  const viewMarkers = new Map<string, { marker: L.Marker; id: number | null }>();
+  let drawnView: { places: PotokPlace[]; clusters: PotokPlaceCluster[] } = { places: [], clusters: [] };
+  // Each ask for places has its number; only the newest reply is drawn.
+  let placesSeq = 0;
+  let countsSeq = 0;
+  let spotSeq = 0;
+  let viewTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingWants: Wants = {};
+  let viewRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastViewRefresh = 0;
+  let movedEarly = false;
+  // How many places show each pin on a small map, by the places it was counted from.
+  let countedFrom: PotokPlace[] | null = null;
+  let allCounts: PotokPinCount[] = [];
 
   const set = (patch: Partial<State>) => {
     state = { ...state, ...patch };
@@ -180,52 +267,205 @@ export function mountMap(root: HTMLElement) {
 
   // --- Loading ---
 
+  // The map's config first, then the map, then the places in its view: the
+  // reply says whether the map gets all of them or Potok gathers them.
   const load = async () => {
     set({ status: 'loading' });
 
     try {
-      const [config, places, appConfig] = await Promise.all([
-        potok.getMapConfig(),
-        potok.listPlaces(),
-        potok.getConfig().catch(() => null),
-      ]);
+      const [config, appConfig] = await Promise.all([potok.getMapConfig(), potok.getConfig().catch(() => null)]);
 
-      if (!config.ok || !places.ok) {
-        const error = !config.ok ? config.error : !places.ok ? places.error : null;
-        set({ status: error === 'unknown_method' ? 'outdated' : 'failed' });
+      if (!config.ok) {
+        set({ status: config.error === 'unknown_method' ? 'outdated' : 'failed' });
         return;
       }
 
       const { ok: _ok, ...mapConfig } = config;
       const stored = appConfig && appConfig.ok ? appConfig.config : null;
 
-      state = {
-        ...state,
-        status: 'ready',
-        config: mapConfig,
-        places: places.places,
-        truncated: places.truncated,
-        appConfig: stored,
-      };
-
+      state = { ...state, config: mapConfig, appConfig: stored };
+      icons = iconKeys(mapConfig.pins);
       startMap(mapConfig, savedBounds(stored?.data) ?? mapConfig.default_bounds);
-      rebuild();
-      draw();
+      movedEarly = false;
+
+      const { reply } = await askPlaces({ extent: true, counts: true });
+
+      if (reply && !reply.ok && reply.error === 'timeout') {
+        // Only a big map's view takes that long: an empty one, until a move.
+        state = { ...state, status: 'ready' };
+        showView({ ok: true, mode: 'view', places: [], clusters: [], total: 0, truncated: false });
+        notify(t('viewTimeout'), true);
+        return;
+      }
+
+      if (!reply || !reply.ok) {
+        set({ status: reply?.error === 'unknown_method' ? 'outdated' : 'failed' });
+        return;
+      }
+
+      state = { ...state, status: 'ready' };
+      take(reply);
+      if (state.mode === 'view' && movedEarly) scheduleView(0);
     } catch {
       set({ status: 'failed' });
     }
   };
 
-  const refresh = async () => {
-    const reply = await potok.listPlaces().catch(() => null);
-    if (!reply || !reply.ok) return;
+  // The places again, after a change: all of them, or the view of a big map
+  // with its counts and extent.
+  const refresh = () => readView({ extent: true, counts: true });
+
+  // What the search and the pin filter keep, as Potok takes them.
+  const filters = (): { search?: string; pins?: string[] } => ({
+    ...(state.search.trim() !== '' ? { search: state.search.trim() } : {}),
+    ...(state.pinFilter.length > 0 ? { pins: state.pinFilter } : {}),
+  });
+
+  const viewQuery = (wants: Wants): PotokPlacesQuery => {
+    const bounds = map!.getBounds();
+
+    return {
+      bbox: viewBox(bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()),
+      zoom: Math.max(0, Math.min(24, Math.round(map!.getZoom()))),
+      ...filters(),
+      ...(wants.extent ? { extent: true } : {}),
+      ...(wants.counts ? { counts: true } : {}),
+    };
+  };
+
+  // Asks for the places in view, and for a big map's counts and extent too
+  // while it has none. The counts are kept from the newest reply that has
+  // them, the extent from any that still fits the filters, so a move does not
+  // lose what a change of the filters asked for.
+  const askPlaces = async (wants: Wants) => {
+    const seq = ++placesSeq;
+    const asked = JSON.stringify(filters());
+    const query = viewQuery({
+      extent: wants.extent || state.extent === null,
+      counts: wants.counts || state.counts.length === 0,
+    });
+    const reply = await potok.listPlaces(query).catch(() => null);
+
+    if (reply && reply.ok && reply.mode === 'view') {
+      if (reply.pins && seq > countsSeq) {
+        countsSeq = seq;
+        state = { ...state, counts: reply.pins };
+      }
+      if (reply.extent && asked === JSON.stringify(filters())) state = { ...state, extent: reply.extent };
+    }
+
+    return { reply, fresh: seq === placesSeq };
+  };
+
+  // A big map's view, or the places again after a change; only the newest
+  // reply is drawn. A view that took too long keeps the last one drawn.
+  const readView = async (wants: Wants) => {
+    if (!map || state.status !== 'ready') return;
+
+    const { reply, fresh } = await askPlaces(wants);
+
+    if (!fresh) {
+      if (state.mode === 'view') draw();
+      return;
+    }
+
+    if (!reply) return;
+
+    if (!reply.ok) {
+      if (reply.error === 'timeout') notify(t('viewTimeout'), true);
+      else if (reply.error === 'rate_limited') scheduleView(RETRY_MS, wants);
+      return;
+    }
+
+    take(reply);
+  };
+
+  // Asks for a big map's view after `delay`; what any ask in between wanted
+  // comes along.
+  const scheduleView = (delay: number, wants: Wants = {}) => {
+    pendingWants = {
+      extent: pendingWants.extent || wants.extent,
+      counts: pendingWants.counts || wants.counts,
+    };
+    clearTimeout(viewTimer);
+    viewTimer = setTimeout(() => {
+      const asked = pendingWants;
+      pendingWants = {};
+      void readView(asked);
+    }, delay);
+  };
+
+  const take = (reply: PotokPlacesAll | PotokPlacesView) => {
+    if (reply.mode === 'view') showView(reply);
+    else showAll(reply);
+  };
+
+  // All of a map's places: what stays picked stays, as it did.
+  const showAll = (reply: PotokPlacesAll) => {
+    if (state.mode === 'view') clearView();
 
     const selected = reply.places.some((place) => place.id === state.selected) ? state.selected : null;
-    const panel = state.panel?.kind === 'spot' ? null : state.panel;
+    const panel = state.panel?.kind === 'spot' || state.panel?.kind === 'at' ? null : state.panel;
     const inside = reply.places.some((place) => place.id === state.inside) ? state.inside : null;
-    state = { ...state, places: reply.places, truncated: reply.truncated, selected, panel, inside, here: null };
+    state = {
+      ...state,
+      mode: 'all',
+      places: reply.places,
+      truncated: reply.truncated,
+      view: null,
+      extent: null,
+      counts: [],
+      selected,
+      panel,
+      inside,
+      here: null,
+    };
     rebuild();
     draw();
+  };
+
+  // A big map's view, drawn over the one before.
+  const showView = (reply: PotokPlacesView) => {
+    if (state.mode === 'all') leaveAll();
+
+    const { places, clusters, total, truncated } = reply;
+    state = { ...state, mode: 'view', truncated: false, view: { places, clusters, total, truncated } };
+    drawView();
+    draw();
+  };
+
+  // From all the places to a big map's view: no places, borders or lines of
+  // their own, no kind or area to keep.
+  const leaveAll = () => {
+    index = null;
+    borders = [];
+    lines = [];
+    pinned = [];
+    shownKey = '';
+    byId.clear();
+    markers.clearLayers();
+    pinMarkers.clear();
+    for (const layer of [areaLayer, maskLayer, chosenLayer, routeLayer]) layer.clearLayers();
+    areaPaths.clear();
+    routePaths.clear();
+
+    state = {
+      ...state,
+      places: [],
+      kind: null,
+      inside: null,
+      here: null,
+      layerMenu: false,
+      panel: state.panel?.kind === 'spot' ? null : state.panel,
+    };
+  };
+
+  // From a big map's view back to all the places.
+  const clearView = () => {
+    for (const { marker } of viewMarkers.values()) markers.removeLayer(marker);
+    viewMarkers.clear();
+    pinMarkers.clear();
+    drawnView = { places: [], clusters: [] };
   };
 
   // --- The map ---
@@ -274,6 +514,17 @@ export function mountMap(root: HTMLElement) {
     map.fitBounds(bounds);
 
     map.on('moveend', () => {
+      if (state.status === 'loading') movedEarly = true;
+
+      // A big map: the markers joined again for this zoom, and the view asked
+      // for once the map stays still.
+      if (state.mode === 'view') {
+        drawView();
+        scheduleView(MOVE_DELAY_MS);
+        if (state.panel?.kind === 'view') draw();
+        return;
+      }
+
       // A zoom can turn an area or a route from a pin into a shape and back.
       const current = shown(state.places, shownOptions());
       if (signature(current) !== shownKey) rebuild(current);
@@ -304,6 +555,7 @@ export function mountMap(root: HTMLElement) {
     inside: state.inside,
     zoom: Math.round(map?.getZoom() ?? 0),
     search: state.search,
+    pins: state.pinFilter.length > 0 ? { keys: new Set(state.pinFilter), icons } : null,
   });
 
   type Shown = ReturnType<typeof shown>;
@@ -616,21 +868,8 @@ export function mountMap(root: HTMLElement) {
       const props = feature.properties;
 
       if ('cluster' in props && props.cluster) {
-        const count = props.point_count;
-        const size = clusterSize(count);
-        const label = t('groupsHere', { n: count });
-        const marker = L.marker([lat, lng], {
-          icon: L.divIcon({
-            html: clusterHtml(count, size, ringGradient(props.tones, pins().tones), label),
-            className: 'pm-cluster-icon',
-            iconSize: [size, size],
-          }),
-          title: label,
-          keyboard: true,
-        });
-
-        marker.on('click', () => openCluster(props.cluster_id, lat, lng));
-        markers.addLayer(marker);
+        const ring = ringGradient(props.tones, pins().tones);
+        markers.addLayer(clusterMarker(props.point_count, lat, lng, ring, () => openCluster(props.cluster_id, lat, lng)));
       } else if ('id' in props) {
         const place = byId.get(props.id);
         if (!place) continue;
@@ -660,6 +899,99 @@ export function mountMap(root: HTMLElement) {
 
     marker.on('click', () => void select(place));
     return marker;
+  };
+
+  // A cluster: its count on a disc, in the ring of its tones.
+  const clusterMarker = (count: number, lat: number, lng: number, ring: string, onClick: () => void) => {
+    const size = clusterSize(count);
+    const label = t('groupsHere', { n: count });
+    const marker = L.marker([lat, lng], {
+      icon: L.divIcon({
+        html: clusterHtml(count, size, ring, label),
+        className: 'pm-cluster-icon',
+        iconSize: [size, size],
+      }),
+      title: label,
+      keyboard: true,
+    });
+
+    marker.on('click', onClick);
+    return marker;
+  };
+
+  // --- A big map's view ---
+
+  // The reply's places and clusters, joined where they would touch at this
+  // zoom; a marker that shows the same as before stays as it is.
+  const drawView = () => {
+    if (!map || !state.view || !state.config) return;
+
+    const current = map;
+    drawnView = mergeMarkers(state.view.places, state.view.clusters, (lat, lng) => current.latLngToLayerPoint([lat, lng]), pins());
+
+    const next = new Map<string, () => { marker: L.Marker; id: number | null }>();
+
+    for (const cluster of drawnView.clusters) {
+      const ring = ringGradient(cluster.tones, pins().tones);
+      next.set(clusterKey(cluster, ring), () => ({
+        marker: clusterMarker(cluster.count, cluster.lat, cluster.lng, ring, () => openViewCluster(cluster)),
+        id: null,
+      }));
+    }
+
+    for (const place of drawnView.places) {
+      next.set(placeKey(place), () => ({ marker: pinMarker(place), id: place.id }));
+    }
+
+    syncKeyed(
+      viewMarkers,
+      next,
+      (item) => markers.addLayer(item.marker),
+      (item) => markers.removeLayer(item.marker),
+    );
+
+    pinMarkers.clear();
+    for (const { marker, id } of viewMarkers.values()) if (id !== null) pinMarkers.set(id, marker);
+    markSelected();
+  };
+
+  // A big map's cluster spreads as the map zooms in; one that never would
+  // becomes a list of its places, from Potok.
+  const openViewCluster = (cluster: PotokPlaceCluster) => {
+    if (!map) return;
+
+    const box = L.latLngBounds(cluster.bounds);
+    const action = clusterAction(cluster.bounds, map.getZoom(), map.getMaxZoom(), map.getBoundsZoom(box.pad(0.2)));
+
+    if (action.list) void openSpot(cluster.bounds);
+    else map.flyTo(box.getCenter(), action.zoom, { duration: FLY_SECONDS });
+  };
+
+  // The places at one spot of a big map, by name, as many as Potok gives.
+  const openSpot = async (bounds: Bounds) => {
+    const seq = ++spotSeq;
+    const reply = await potok.listPlacesAt(bounds, filters()).catch(() => null);
+    if (seq !== spotSeq || state.mode !== 'view') return;
+
+    if (!reply || !reply.ok) {
+      notify(reply && !reply.ok && reply.error === 'unknown_method' ? t('outdated') : t('spotFailed'), true);
+      return;
+    }
+
+    set({ panel: { kind: 'at', places: reply.places, hasMore: reply.has_more }, menu: false, here: null });
+  };
+
+  // The markers a big map draws in view: places alone, and how many the
+  // clusters hold.
+  const viewInView = (): { places: PotokPlace[]; gathered: number } => {
+    if (!map) return { places: [], gathered: 0 };
+
+    const bounds = map.getBounds();
+    const gathered = drawnView.clusters
+      .filter((cluster) => bounds.contains([cluster.lat, cluster.lng]))
+      .reduce((sum, cluster) => sum + cluster.count, 0);
+
+    return { places: inView(drawnView.places, currentBounds(), lang), gathered };
   };
 
   // A cluster opens up a zoom level at a time; one that never would (places
@@ -702,8 +1034,15 @@ export function mountMap(root: HTMLElement) {
   };
 
   // Everything the chips, the search and "only inside" keep: areas and
-  // routes whole, pins where they stand.
+  // routes whole, pins where they stand. A big map: the box Potok gave
+  // around what the filters keep.
   const fitAll = () => {
+    if (state.mode === 'view') {
+      const bounds = state.extent?.bounds;
+      if (map && bounds) map.flyToBounds(bounds, { padding: FIT_PADDING, maxZoom: PLACE_ZOOM, duration: FLY_SECONDS });
+      return;
+    }
+
     const corners: [number, number][] = kept(state.places, shownOptions()).flatMap((place) => {
       const whole = place.shape === 'area' ? state.layers.areas : place.shape === 'route' && state.layers.routes;
 
@@ -722,10 +1061,47 @@ export function mountMap(root: HTMLElement) {
     map.flyToBounds(L.latLngBounds(corners), { padding: FIT_PADDING, maxZoom: PLACE_ZOOM, duration: FLY_SECONDS });
   };
 
+  // The search and the pin filter: here on a small map, at Potok on a big one,
+  // where the places at a spot are listed again by a tap.
   const setSearch = (search: string) => {
+    if (state.mode === 'view') {
+      set({ search, panel: state.panel?.kind === 'at' ? null : state.panel });
+      scheduleView(SEARCH_DELAY_MS, { extent: true });
+      return;
+    }
+
     state = { ...state, search, panel: state.panel?.kind === 'spot' ? null : state.panel, here: null };
     rebuild();
     draw();
+  };
+
+  const setPinFilter = (pinFilter: string[]) => {
+    if (state.mode === 'view') {
+      set({ pinFilter, panel: state.panel?.kind === 'at' ? null : state.panel });
+      scheduleView(0, { extent: true });
+      return;
+    }
+
+    state = { ...state, pinFilter, panel: state.panel?.kind === 'spot' ? null : state.panel, here: null };
+    rebuild();
+    draw();
+  };
+
+  // The pins on the map as chips: counted here on a small map, by Potok on a
+  // big one, named as the legend says.
+  const pinChipOptions = (): PinOption[] => {
+    if (state.mode === 'all' && countedFrom !== state.places) {
+      countedFrom = state.places;
+      allCounts = pinCounts(state.places, pins());
+    }
+
+    return pinOptions(
+      state.mode === 'view' ? state.counts : allCounts,
+      pins(),
+      legendOf(state.appConfig?.data),
+      { kind: t('pinKind'), picture: t('pinPicture') },
+      state.pinFilter,
+    );
   };
 
   const currentBounds = (): Bounds => {
@@ -739,7 +1115,15 @@ export function mountMap(root: HTMLElement) {
   // --- Adding a place ---
 
   const startAdding = () =>
-    set({ adding: { step: 'aim' }, panel: null, menu: false, layerMenu: false, selected: null, here: null });
+    set({
+      adding: { step: 'aim' },
+      panel: null,
+      menu: false,
+      layerMenu: false,
+      selected: null,
+      here: null,
+      legendForm: null,
+    });
 
   const cancelAdding = () => {
     draft?.remove();
@@ -810,20 +1194,28 @@ export function mountMap(root: HTMLElement) {
 
     draft?.remove();
     draft = null;
+
+    // A big map: the view again, with the new place in it and in the counts.
+    if (state.mode === 'view') {
+      state = { ...state, adding: null };
+      void readView({ extent: true, counts: true });
+      void select(reply.place);
+      return;
+    }
+
     state = { ...state, adding: null, places: [...state.places.filter((p) => p.id !== reply.place.id), reply.place] };
     rebuild();
     void select(reply.place);
   };
 
-  // --- The starting view, for editors ---
+  // --- The starting view and the legend, for editors ---
 
-  const saveView = async (bounds: Bounds | null) => {
-    set({ menu: false });
-
+  // Writes one change into the app's config, keeping the rest of it; true
+  // once it is saved.
+  const writeConfig = async (change: (data: Record<string, unknown>) => void): Promise<boolean> => {
     const write = async (config: PotokConfig | null) => {
       const data = { ...(config?.data ?? {}) } as Record<string, unknown>;
-      if (bounds) data.view = { bounds: bounds.map(([lat, lng]) => [round5(lat), round5(lng)]) };
-      else delete data.view;
+      change(data);
 
       return potok.saveConfig(data, { revision: config?.revision ?? 0 });
     };
@@ -836,12 +1228,62 @@ export function mountMap(root: HTMLElement) {
       if (fresh && fresh.ok) reply = await write(fresh.config).catch(() => null);
     }
 
-    if (reply && reply.ok) {
-      state = { ...state, appConfig: reply.config };
+    if (!reply || !reply.ok) return false;
+
+    state = { ...state, appConfig: reply.config };
+    return true;
+  };
+
+  const saveView = async (bounds: Bounds | null) => {
+    set({ menu: false });
+
+    const saved = await writeConfig((data) => {
+      if (bounds) data.view = { bounds: bounds.map(([lat, lng]) => [round5(lat), round5(lng)]) };
+      else delete data.view;
+    });
+
+    if (saved) {
       notify(t('viewSaved'));
       if (!bounds && map && state.config) map.fitBounds(state.config.default_bounds);
     } else {
       notify(t('viewFailed'), true);
+    }
+  };
+
+  // The legend: the names the editors give the map's pins, as they typed
+  // them; an empty one brings back the icon's own.
+  const startLegend = () =>
+    set({
+      legendForm: { names: { ...legendOf(state.appConfig?.data) }, saving: false, error: null },
+      menu: false,
+      layerMenu: false,
+      panel: null,
+      here: null,
+    });
+
+  const nameLegend = (key: string, name: string) => {
+    if (!state.legendForm) return;
+    set({ legendForm: { ...state.legendForm, names: { ...state.legendForm.names, [key]: name }, error: null } });
+  };
+
+  const saveLegend = async (event: Event) => {
+    event.preventDefault();
+    const form = state.legendForm;
+    if (!form || form.saving) return;
+
+    const legend = legendOf({ legend: form.names });
+    set({ legendForm: { ...form, saving: true, error: null } });
+
+    const saved = await writeConfig((data) => {
+      if (Object.keys(legend).length > 0) data.legend = legend;
+      else delete data.legend;
+    });
+
+    if (saved) {
+      state = { ...state, legendForm: null };
+      notify(t('legendSaved'));
+    } else {
+      set({ legendForm: { ...form, saving: false, error: t('legendFailed') } });
     }
   };
 
@@ -866,15 +1308,21 @@ export function mountMap(root: HTMLElement) {
     }
 
     const config = state.config!;
+    const big = state.mode === 'view';
+    const hasPlaces = big || state.places.length > 0;
     const kinds = kindsOnMap(state.places, config.pins);
     const hasAreas = state.places.some((place) => place.shape === 'area');
     const hasRoutes = state.places.some((place) => place.shape === 'route');
     const insidePlace = state.inside === null ? undefined : byId.get(state.inside);
+    const pinChoices = pinChipOptions();
+    const hasPinChips = pinChoices.length > 1 || state.pinFilter.length > 0;
+    const canFit = big ? Boolean(state.extent?.bounds) : state.places.length > 0;
 
     return html`
       <div class="pm-top">
-        ${state.places.length > 0 ? searchField() : nothing}
+        ${hasPlaces ? searchField() : nothing}
         ${kinds.length > 1 ? kindChips(kinds) : nothing}
+        ${hasPinChips ? pinChips(pinChoices) : nothing}
         ${insidePlace
           ? html`<div class="pm-chips">
               <button
@@ -894,10 +1342,11 @@ export function mountMap(root: HTMLElement) {
         ${state.truncated
           ? html`<p class="pm-note">${t('truncated', { n: state.places.length })}</p>`
           : nothing}
-        ${state.places.length === 0 && !state.adding ? emptyCard(config) : nothing}
+        ${big && state.view?.truncated ? html`<p class="pm-note">${t('viewTruncated')}</p>` : nothing}
+        ${!hasPlaces && !state.adding ? emptyCard(config) : nothing}
       </div>
       <div class="pm-tools">
-        ${state.places.length > 0 ? roundButton('fit', t('showAll'), fitAll) : nothing}
+        ${canFit ? roundButton('fit', t('showAll'), fitAll) : nothing}
         ${roundButton(
           'list',
           state.panel?.kind === 'view' ? t('closeList') : t('list'),
@@ -916,15 +1365,21 @@ export function mountMap(root: HTMLElement) {
             )
           : nothing}
         ${config.can_edit_view
-          ? roundButton('bookmark', t('startView'), () => set({ menu: !state.menu, layerMenu: false }), state.menu)
+          ? roundButton(
+              'bookmark',
+              hasPinChips ? t('editMap') : t('startView'),
+              () => set({ menu: !state.menu, layerMenu: false }),
+              state.menu,
+            )
           : nothing}
-        ${state.menu ? viewMenu() : nothing} ${state.layerMenu ? layerMenu(hasAreas, hasRoutes) : nothing}
+        ${state.menu ? viewMenu(hasPinChips) : nothing} ${state.layerMenu ? layerMenu(hasAreas, hasRoutes) : nothing}
       </div>
       ${state.panel ? panel(state.panel) : nothing}
       ${state.here && !state.adding && !state.panel ? hereCard(state.here) : nothing}
       ${state.adding?.step === 'aim' ? aimCard() : nothing}
       ${state.adding?.step === 'form' ? placeForm(state.adding, config) : nothing}
-      ${config.can_create_places && !state.adding && !state.panel && !state.here
+      ${state.legendForm && !state.adding ? legendSheet(state.legendForm, pinChoices) : nothing}
+      ${config.can_create_places && !state.adding && !state.panel && !state.here && !state.legendForm
         ? html`<div class="pm-bottom">
             <button type="button" id="pm-add" class="pm-pill pm-pill-primary pm-fab" @click=${startAdding}>
               ${icon('plus', 'size-5')} ${t('addPlace')}
@@ -977,6 +1432,76 @@ export function mountMap(root: HTMLElement) {
   };
 
   const kindLook = (kind: string) => lookOf({ kind, pin: null, picture_url: null }, pins());
+
+  const numbers = new Intl.NumberFormat(lang === 'en' ? 'en' : 'sr-Latn');
+
+  // The pin filter: any of the pins picked, every pin when none is.
+  const pinChips = (options: PinOption[]) => html`
+    <div class="pm-chips" role="toolbar" aria-label=${t('pinFilter')} id="pm-pins">
+      ${options.map((option) => {
+        const active = state.pinFilter.includes(option.key);
+
+        return html`<button
+          type="button"
+          class="pm-chip ${active ? 'is-active' : ''}"
+          aria-pressed=${String(active)}
+          data-pin=${option.key}
+          @click=${() => setPinFilter(togglePin(state.pinFilter, option.key))}
+        >
+          <span class="pm-chip-pin">${unsafeSVG(pinSvg(option.look, pins(), { size: 18 }))}</span>
+          <span>${option.title}</span>
+          <span class="pm-chip-count">${numbers.format(option.count)}</span>
+        </button>`;
+      })}
+      ${state.pinFilter.length > 0
+        ? html`<button
+            type="button"
+            id="pm-pins-clear"
+            class="pm-chip pm-chip-clear"
+            aria-label=${t('clearPins')}
+            title=${t('clearPins')}
+            @click=${() => setPinFilter([])}
+          >
+            ${icon('close', 'size-4')}
+          </button>`
+        : nothing}
+    </div>
+  `;
+
+  // The editors' names for the pins on the map, each over the icon's own.
+  const legendSheet = (form: LegendForm, options: PinOption[]) => html`
+    <form class="pm-sheet" id="pm-legend" @submit=${saveLegend} novalidate>
+      <div>
+        <h2 class="font-semibold">${t('legend')}</h2>
+        <p class="mt-1 text-sm opacity-70">${t('legendHint')}</p>
+      </div>
+      <div class="pm-legend">
+        ${options.map(
+          (option) => html`<label class="pm-legend-row">
+            <span class="pm-row-pin">${unsafeSVG(pinSvg(option.look, pins(), { size: 28 }))}</span>
+            <input
+              class="pm-input"
+              type="text"
+              maxlength=${LEGEND_MAX}
+              autocomplete="off"
+              data-pin=${option.key}
+              aria-label=${option.fallback}
+              placeholder=${option.fallback}
+              .value=${form.names[option.key] ?? ''}
+              @input=${(event: Event) => nameLegend(option.key, (event.target as HTMLInputElement).value)}
+            />
+          </label>`,
+        )}
+      </div>
+      ${form.error ? html`<p class="text-sm text-error" role="alert">${form.error}</p>` : nothing}
+      <div class="flex justify-end gap-2">
+        <button type="button" class="pm-pill" @click=${() => set({ legendForm: null })}>${t('cancel')}</button>
+        <button type="submit" id="pm-legend-save" class="pm-pill pm-pill-primary" ?disabled=${form.saving}>
+          ${icon('check', 'size-4')} ${form.saving ? t('saving') : t('save')}
+        </button>
+      </div>
+    </form>
+  `;
 
   const roundButton = (name: IconName, label: string, onClick: () => void, pressed = false) => html`<button
     type="button"
@@ -1066,13 +1591,18 @@ export function mountMap(root: HTMLElement) {
     </section>`;
   };
 
-  const viewMenu = () => html`<div class="pm-menu" role="menu">
+  const viewMenu = (legend: boolean) => html`<div class="pm-menu" role="menu">
     <button type="button" role="menuitem" class="pm-menu-item" @click=${() => void saveView(currentBounds())}>
       ${icon('bookmark', 'size-4')} ${t('saveView')}
     </button>
     <button type="button" role="menuitem" class="pm-menu-item" @click=${() => void saveView(null)}>
       ${icon('home', 'size-4')} ${t('resetView')}
     </button>
+    ${legend
+      ? html`<button type="button" role="menuitem" id="pm-legend-open" class="pm-menu-item" @click=${startLegend}>
+          ${icon('legend', 'size-4')} ${t('legend')}
+        </button>`
+      : nothing}
   </div>`;
 
   const emptyCard = (config: PotokMapConfig) => html`<div class="pm-card pm-empty">
@@ -1083,38 +1613,58 @@ export function mountMap(root: HTMLElement) {
     </div>
   </div>`;
 
+  // The places in view, or at one spot. A big map lists the places alone in
+  // view and says how many more the circles hold.
   const panel = (current: Panel) => {
+    const big = current.kind === 'view' && state.mode === 'view' ? viewInView() : null;
     const shown =
       current.kind === 'spot'
         ? current.ids.map((id) => byId.get(id)).filter((place): place is PotokPlace => place !== undefined)
-        : map
-          ? inView(pinned, currentBounds(), lang)
-          : [];
+        : current.kind === 'at'
+          ? current.places
+          : big
+            ? big.places
+            : map
+              ? inView(pinned, currentBounds(), lang)
+              : [];
+    const atSpot = current.kind !== 'view';
+    const more = current.kind === 'at' && current.hasMore;
+    const gathered = big?.gathered ?? 0;
 
-    return html`<section class="pm-panel" aria-label=${current.kind === 'spot' ? t('atSpot') : t('list')}>
+    return html`<section class="pm-panel" aria-label=${atSpot ? t('atSpot') : t('list')}>
       <header class="pm-panel-head">
-        <h2 class="font-semibold">${current.kind === 'spot' ? t('atSpot') : t('inView')}</h2>
-        <span class="pm-chip-count">${shown.length}</span>
+        <h2 class="font-semibold">${atSpot ? t('atSpot') : t('inView')}</h2>
+        <span class="pm-chip-count">${shown.length}${more ? '+' : ''}</span>
         <span class="flex-1"></span>
         ${roundButton('close', t('closeList'), () => set({ panel: null }))}
       </header>
-      ${shown.length === 0
+      ${shown.length === 0 && gathered === 0
         ? html`<p class="px-4 pb-4 text-sm opacity-70">${t('noneInView')}</p>`
-        : html`<ul class="pm-panel-list">
-            ${shown.map((place) => placeRow(place))}
-          </ul>`}
+        : shown.length === 0
+          ? nothing
+          : html`<ul class="pm-panel-list">
+              ${shown.map((place) => placeRow(place))}
+            </ul>`}
+      ${gathered > 0
+        ? html`<p class="pm-panel-note" id="pm-in-clusters">${t('inClusters', { n: numbers.format(gathered) })}</p>`
+        : nothing}
+      ${more ? html`<p class="pm-panel-note">${t('spotMore', { n: shown.length })}</p>` : nothing}
     </section>`;
   };
 
   const placeRow = (place: PotokPlace) => {
     const kind = pins().kinds.find((row) => row.key === place.kind);
+    // A plain group ("none") says what its pin says, as the legend names it,
+    // rather than that it has no kind: every row of a dataset would say so.
+    const icon = place.kind === 'none' && place.pin ? pins().icons.find((row) => row.key === place.pin) : undefined;
+    const pinName = icon ? (legendOf(state.appConfig?.data)[icon.key] ?? icon.title) : undefined;
     const holder = place.areas.length > 0 ? byId.get(place.areas[0]) : undefined;
     const what =
       place.shape === 'area'
         ? t('area')
         : place.shape === 'route'
           ? `${t('route')}${place.length ? ` · ${distance(place.length, lang)}` : ''}`
-          : (kind?.title ?? '');
+          : (pinName ?? kind?.title ?? '');
     const where = holder ? t(place.shape === 'route' ? 'through' : 'inArea', { n: holder.name }) : '';
 
     return html`<li>
@@ -1209,6 +1759,20 @@ export function mountMap(root: HTMLElement) {
   // --- Live ---
 
   potok.onSubgroupsChange(() => {
+    // A big map reads again at most once in `VIEW_REFRESH_MS`, still at a
+    // moment of its own.
+    if (state.mode === 'view') {
+      if (viewRefreshTimer !== undefined) return;
+
+      const wait = Math.max(0, lastViewRefresh + VIEW_REFRESH_MS - Date.now()) + Math.random() * REFRESH_SPREAD_MS;
+      viewRefreshTimer = setTimeout(() => {
+        viewRefreshTimer = undefined;
+        lastViewRefresh = Date.now();
+        void refresh();
+      }, wait);
+      return;
+    }
+
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(() => void refresh(), Math.random() * REFRESH_SPREAD_MS);
   });
@@ -1216,7 +1780,8 @@ export function mountMap(root: HTMLElement) {
   potok.onGroupSheetClose((id) => {
     if (state.selected !== id) return;
     state = { ...state, selected: null };
-    drawMarkers();
+    if (state.mode === 'view') markSelected();
+    else drawMarkers();
     drawAreas();
     draw();
   });
@@ -1224,6 +1789,7 @@ export function mountMap(root: HTMLElement) {
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
     if (state.adding) cancelAdding();
+    else if (state.legendForm && !state.legendForm.saving) set({ legendForm: null });
     else if (state.menu || state.layerMenu) set({ menu: false, layerMenu: false });
     else if (state.panel) set({ panel: null });
     else if (state.here) closeHere();

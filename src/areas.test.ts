@@ -15,6 +15,8 @@ import {
   spanPx,
   type Geo,
 } from './areas';
+import catalogue from './dev-catalogue.json';
+import { iconKeys, type Pins } from './places';
 import type { PotokPlace } from './potok';
 
 const square = (lat: number, lng: number, half: number): [number, number][] => [
@@ -120,6 +122,43 @@ describe('what the map shows', () => {
     const { borders, pins } = shown(places, { layers, kind: null, inside: 10, zoom: 8 });
     expect(borders).toEqual([]);
     expect(pins.map((place) => place.id)).toEqual([1, 11]);
+  });
+});
+
+describe('the pin filter', () => {
+  const icons = iconKeys(catalogue.pins as Pins);
+  const layers = { places: true, areas: true, routes: true };
+  const killed = { ...point(1), name: 'Poginuli · Barajevo', pin: 'problem' };
+  const injured = { ...point(2), name: 'Povređeni · Barajevo', pin: 'warning' };
+  const damage = { ...point(3), name: 'Materijalna šteta · Niš', pin: 'transport' };
+  const plain = point(4);
+  const retired = { ...point(5), pin: 'retired' };
+  const city = { ...area(10, 0.2), pin: 'institution' };
+  const places = [killed, injured, damage, plain, retired, city];
+  const only = (...keys: string[]) => ({ keys: new Set(keys), icons });
+  const ids = (options: Parameters<typeof shown>[1]) => shown(places, options).pins.map((place) => place.id);
+
+  it('keeps the places that show any of the pins picked', () => {
+    expect(ids({ layers, kind: null, inside: null, zoom: 8, pins: only('problem') })).toEqual([1]);
+    expect(ids({ layers, kind: null, inside: null, zoom: 8, pins: only('problem', 'warning') })).toEqual([1, 2]);
+  });
+
+  it('keeps every place with none picked', () => {
+    expect(ids({ layers, kind: null, inside: null, zoom: 8, pins: only() })).toEqual([1, 2, 3, 4, 5, 10]);
+    expect(ids({ layers, kind: null, inside: null, zoom: 8, pins: null })).toEqual([1, 2, 3, 4, 5, 10]);
+  });
+
+  it('"kind" keeps the places that show their kind, an icon the catalogue lost too', () => {
+    expect(ids({ layers, kind: null, inside: null, zoom: 8, pins: only('kind') })).toEqual([4, 5]);
+  });
+
+  it('works with the search, and keeps an area by its pin and its border with it', () => {
+    expect(ids({ layers, kind: null, inside: null, zoom: 8, pins: only('problem', 'transport'), search: 'barajevo' })).toEqual([1]);
+
+    const areas = shown(places, { layers, kind: null, inside: null, zoom: 8, pins: only('institution') });
+    expect(areas.pins.map((place) => place.id)).toEqual([10]);
+    expect(areas.borders.map((place) => place.id)).toEqual([10]);
+    expect(shown(places, { layers, kind: null, inside: null, zoom: 8, pins: only('problem') }).borders).toEqual([]);
   });
 });
 

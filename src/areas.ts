@@ -1,11 +1,12 @@
 import { nameMatches } from './fold';
+import { pinKeyOf } from './places';
 import type { PotokPlace, PotokPlaceShape } from './potok';
 
 // Areas and routes among the map's places (`shape: "area"`, `"route"`), as
 // Potok's own map shows them: each is only the shape of its group, which the
-// kind chips and the search keep or leave out like any place. Its pin is one
-// of the pins, in the clusters like any other (a route's at its start), and
-// once it is wide enough on the screen an area's border is drawn under the
+// kind and pin chips and the search keep or leave out like any place. Its pin
+// is one of the pins, in the clusters like any other (a route's at its start),
+// and once it is wide enough on the screen an area's border is drawn under the
 // pins, a route's line over the borders. Kept free of the DOM (areas.test.ts).
 
 /** Any shape `placeShapes` gives: a border or a line. */
@@ -52,6 +53,11 @@ export type ShownOptions = {
   inside: number | null;
   zoom: number;
   search?: string;
+  /**
+   * The pin filter: only places that show one of `keys` (`pinKeyOf`, with the
+   * catalogue's `icons`). None, or no keys, keeps every pin.
+   */
+  pins?: { keys: ReadonlySet<string>; icons: ReadonlySet<string> } | null;
 };
 
 // With places off, the shapes whose layer is on; the areas when neither is,
@@ -62,18 +68,20 @@ function shapeKept(place: PotokPlace, layers: Layers): boolean {
 }
 
 /**
- * The places the kind chip, the search and "only inside" keep, areas and
- * routes as much as points: `inside` keeps the places inside that area (a
- * route that passes through it too), not the area itself. With places off,
- * only the shapes whose layer is on.
+ * The places the kind chip, the pin filter, the search and "only inside"
+ * keep, areas and routes as much as points: `inside` keeps the places inside
+ * that area (a route that passes through it too), not the area itself. With
+ * places off, only the shapes whose layer is on.
  */
 export function kept(places: PotokPlace[], options: Omit<ShownOptions, 'zoom'>): PotokPlace[] {
-  const { layers, kind, inside, search = '' } = options;
+  const { layers, kind, inside, search = '', pins = null } = options;
+  const pinKept = (place: PotokPlace) => !pins || pins.keys.size === 0 || pins.keys.has(pinKeyOf(place, pins.icons));
 
   return places.filter(
     (place) =>
       (inside === null || (place.id !== inside && place.areas.includes(inside))) &&
       (kind === null || place.kind === kind) &&
+      pinKept(place) &&
       (layers.places || shapeKept(place, layers)) &&
       nameMatches(place.name, search),
   );
