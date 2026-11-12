@@ -136,6 +136,8 @@ type State = {
   inside: number | null;
   here: Here | null;
   search: string;
+  /** Someone without an account: the map is theirs to look at, not to add to. */
+  guest: boolean;
 };
 
 const PLACE_ZOOM = 16;
@@ -204,6 +206,7 @@ export function mountMap(root: HTMLElement) {
     inside: null,
     here: null,
     search: '',
+    guest: false,
   };
 
   let map: L.Map | null = null;
@@ -273,7 +276,11 @@ export function mountMap(root: HTMLElement) {
     set({ status: 'loading' });
 
     try {
-      const [config, appConfig] = await Promise.all([potok.getMapConfig(), potok.getConfig().catch(() => null)]);
+      const [config, appConfig, profile] = await Promise.all([
+        potok.getMapConfig(),
+        potok.getConfig().catch(() => null),
+        potok.getCurrentProfile().catch(() => undefined),
+      ]);
 
       if (!config.ok) {
         set({ status: config.error === 'unknown_method' ? 'outdated' : 'failed' });
@@ -282,10 +289,11 @@ export function mountMap(root: HTMLElement) {
 
       const { ok: _ok, ...mapConfig } = config;
       const stored = appConfig && appConfig.ok ? appConfig.config : null;
+      const saved = savedBounds(stored?.data);
 
-      state = { ...state, config: mapConfig, appConfig: stored };
+      state = { ...state, config: mapConfig, appConfig: stored, guest: profile === null };
       icons = iconKeys(mapConfig.pins);
-      startMap(mapConfig, savedBounds(stored?.data) ?? mapConfig.default_bounds);
+      startMap(mapConfig, saved ?? mapConfig.default_bounds);
       movedEarly = false;
 
       const { reply } = await askPlaces({ extent: true, counts: true });
@@ -305,6 +313,10 @@ export function mountMap(root: HTMLElement) {
 
       state = { ...state, status: 'ready' };
       take(reply);
+
+      // The view the editors saved is in the app's config, which a guest or a
+      // non-member does not get: they open on the places, as "Show all" does.
+      if (!saved && !(appConfig && appConfig.ok) && !movedEarly) fitAll(false);
       if (state.mode === 'view' && movedEarly) scheduleView(0);
     } catch {
       set({ status: 'failed' });
@@ -1036,10 +1048,17 @@ export function mountMap(root: HTMLElement) {
   // Everything the chips, the search and "only inside" keep: areas and
   // routes whole, pins where they stand. A big map: the box Potok gave
   // around what the filters keep.
-  const fitAll = () => {
+  const fitAll = (animate = true) => {
+    const fit = (bounds: L.LatLngBoundsExpression) => {
+      if (!map) return;
+
+      if (animate) map.flyToBounds(bounds, { padding: FIT_PADDING, maxZoom: PLACE_ZOOM, duration: FLY_SECONDS });
+      else map.fitBounds(bounds, { padding: FIT_PADDING, maxZoom: PLACE_ZOOM });
+    };
+
     if (state.mode === 'view') {
       const bounds = state.extent?.bounds;
-      if (map && bounds) map.flyToBounds(bounds, { padding: FIT_PADDING, maxZoom: PLACE_ZOOM, duration: FLY_SECONDS });
+      if (bounds) fit(bounds);
       return;
     }
 
@@ -1057,8 +1076,8 @@ export function mountMap(root: HTMLElement) {
       return [[place.lat, place.lng] as [number, number]];
     });
 
-    if (!map || corners.length === 0) return;
-    map.flyToBounds(L.latLngBounds(corners), { padding: FIT_PADDING, maxZoom: PLACE_ZOOM, duration: FLY_SECONDS });
+    if (corners.length === 0) return;
+    fit(L.latLngBounds(corners));
   };
 
   // The search and the pin filter: here on a small map, at Potok on a big one,
@@ -1346,7 +1365,7 @@ export function mountMap(root: HTMLElement) {
         ${!hasPlaces && !state.adding ? emptyCard(config) : nothing}
       </div>
       <div class="pm-tools">
-        ${canFit ? roundButton('fit', t('showAll'), fitAll) : nothing}
+        ${canFit ? roundButton('fit', t('showAll'), () => fitAll()) : nothing}
         ${roundButton(
           'list',
           state.panel?.kind === 'view' ? t('closeList') : t('list'),
@@ -1609,7 +1628,9 @@ export function mountMap(root: HTMLElement) {
     <span class="pm-empty-icon">${icon('map', 'size-5')}</span>
     <div>
       <p class="font-semibold">${t('empty')}</p>
-      <p class="text-sm opacity-70">${config.can_create_places ? t('emptyCreate') : t('emptySettings')}</p>
+      <p class="text-sm opacity-70">
+        ${config.can_create_places ? t('emptyCreate') : state.guest ? t('emptyGuest') : t('emptySettings')}
+      </p>
     </div>
   </div>`;
 
