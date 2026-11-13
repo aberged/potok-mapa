@@ -168,6 +168,23 @@ export function areasAt(drawn: { id: number; geo: Geo }[], lat: number, lng: num
     .map(({ id }) => id);
 }
 
+/**
+ * The ids of the areas among `borders` that hold another of them, by the
+ * `areas` Potok gives each place (a bigger area holding its pin): their
+ * borders get a wide soft band under every border, so each shows where the
+ * smaller ones' lie on it, as a municipality's around its local communities.
+ */
+export function holders(borders: PotokPlace[]): Set<number> {
+  const drawn = new Set(borders.map((place) => place.id));
+  const holding = new Set<number>();
+
+  for (const place of borders) {
+    for (const id of place.areas) if (id !== place.id && drawn.has(id)) holding.add(id);
+  }
+
+  return holding;
+}
+
 /** The outer rings of a border as Leaflet's [lat, lng] lists: the holes of the dimming around it. */
 export function outerRings(geo: Geo): [number, number][][] {
   return geo.coordinates.map(([shell]) => (shell ?? []).map(([lng, lat]) => [lat, lng] as [number, number]));

@@ -4,6 +4,7 @@ import { unsafeSVG } from 'lit-html/directives/unsafe-svg.js';
 import {
   areasAt,
   distance,
+  holders,
   inBox,
   kept,
   LEVELS,
@@ -153,6 +154,9 @@ const SHAPES_PER_CALL = 100;
 const MAX_BORDERS = 300;
 // Lines a view draws at most, the widest first, as on Potok's map.
 const MAX_LINES = 150;
+// The band under the border of an area that holds drawn ones, as on Potok's
+// map: wider than a border on either side, so it shows past those on it.
+const BAND_WEIGHT = 8;
 // How long a move to a place or an area takes, in seconds, as on Potok's map.
 const FLY_SECONDS = 0.5;
 // A big map asks for its view this long after it stops moving, and after the
@@ -213,11 +217,18 @@ export function mountMap(root: HTMLElement) {
   let index: Index | null = null;
   let draft: L.Marker | null = null;
   const markers = L.layerGroup();
+  const bandLayer = L.layerGroup();
   const areaLayer = L.layerGroup();
   const maskLayer = L.layerGroup();
   const chosenLayer = L.layerGroup();
   const routeLayer = L.layerGroup();
-  let renderers: { areas: L.Renderer; mask: L.Renderer; chosen: L.Renderer; routes: L.Renderer } | null = null;
+  let renderers: {
+    bands: L.Renderer;
+    areas: L.Renderer;
+    mask: L.Renderer;
+    chosen: L.Renderer;
+    routes: L.Renderer;
+  } | null = null;
   // What is shown at the current zoom (`shown`): which areas are borders and
   // which routes are lines.
   let borders: PotokPlace[] = [];
@@ -499,10 +510,12 @@ export function mountMap(root: HTMLElement) {
     L.control.zoom({ position: 'bottomright' }).addTo(map);
     L.tileLayer(config.tiles.url, { maxZoom: config.tiles.max_zoom, attribution: config.tiles.attribution }).addTo(map);
 
-    // Areas under the pins, the dimming around the one "only inside" keeps
-    // above them, its border above that, and routes over all of them, still
-    // under the pins.
+    // The bands of the areas that hold others under every area, areas under
+    // the pins, the dimming around the one "only inside" keeps above them,
+    // its border above that, and routes over all of them, still under the
+    // pins.
     for (const [name, zIndex] of [
+      ['pmBands', '340'],
       ['pmAreas', '350'],
       ['pmMask', '360'],
       ['pmChosen', '370'],
@@ -512,12 +525,14 @@ export function mountMap(root: HTMLElement) {
     }
 
     renderers = {
+      bands: L.svg({ pane: 'pmBands', padding: 0.5 }),
       areas: L.svg({ pane: 'pmAreas', padding: 0.5 }),
       mask: L.svg({ pane: 'pmMask', padding: 0.5 }),
       chosen: L.svg({ pane: 'pmChosen', padding: 0.5 }),
       routes: L.svg({ pane: 'pmRoutes', padding: 0.5 }),
     };
 
+    bandLayer.addTo(map);
     areaLayer.addTo(map);
     maskLayer.addTo(map);
     chosenLayer.addTo(map);
@@ -673,6 +688,7 @@ export function mountMap(root: HTMLElement) {
   const drawAreas = () => {
     if (!map || !renderers || !state.config) return;
 
+    bandLayer.clearLayers();
     areaLayer.clearLayers();
     maskLayer.clearLayers();
     chosenLayer.clearLayers();
@@ -680,8 +696,10 @@ export function mountMap(root: HTMLElement) {
 
     const view = map.getBounds();
     const holes: [number, number][][] = [];
+    const drawn = bordersInView();
+    const holding = holders(drawn);
 
-    for (const place of bordersInView()) {
+    for (const place of drawn) {
       const geo = borderOf(place);
       const color = lookOf(place, pins()).color;
 
@@ -690,8 +708,9 @@ export function mountMap(root: HTMLElement) {
         const covers =
           west <= view.getWest() && east >= view.getEast() && south <= view.getSouth() && north >= view.getNorth();
         const classes = ['pm-area', covers ? 'is-outline' : '', state.here?.selected === place.id ? 'is-selected' : ''];
+        const latlngs = toLatLngs(geo);
 
-        const path = L.polygon(toLatLngs(geo), {
+        const path = L.polygon(latlngs, {
           renderer: renderers.areas,
           color,
           fillColor: color,
@@ -700,6 +719,19 @@ export function mountMap(root: HTMLElement) {
         }).addTo(areaLayer);
 
         areaPaths.set(place.id, path);
+
+        // An area that holds a drawn one: a band under its border, in a pane
+        // under every area, so it covers no border, nor the one picked.
+        if (holding.has(place.id)) {
+          L.polygon(latlngs, {
+            renderer: renderers.bands,
+            color,
+            weight: BAND_WEIGHT,
+            fill: false,
+            interactive: false,
+            className: 'pm-area-band',
+          }).addTo(bandLayer);
+        }
       }
     }
 

@@ -3,6 +3,7 @@ import {
   areasAt,
   contains,
   distance,
+  holders,
   inBox,
   isDrawn,
   isLine,
@@ -193,6 +194,31 @@ describe('a border', () => {
   it('gives its outer rings as holes for the dimming', () => {
     expect(outerRings(holed)).toHaveLength(2);
     expect(outerRings(holed)[0][0]).toEqual([45.15, 19.75]);
+  });
+});
+
+describe('a border around borders', () => {
+  const layers = { places: true, areas: true, routes: true };
+  const city = area(10, 0.2);
+  const quarter = area(11, 0.05, [10]);
+  // Far from the city, holding a bench, a point.
+  const park: PotokPlace = { ...area(12, 0.15), lat: 44.0, lng: 21.0, bbox: [20.85, 43.85, 21.15, 44.15] };
+  const bench: PotokPlace = { ...point(1, 'chat', [12]), lat: 44.0, lng: 21.0 };
+  const places = [bench, quarter, park, city];
+  const bordersAt = (zoom: number) => shown(places, { layers, kind: null, inside: null, zoom }).borders;
+
+  it('an area that holds a border drawn inside it gets the band, one that holds only points does not', () => {
+    expect(bordersAt(10).map((place) => place.id)).toEqual([10, 12, 11]);
+    expect([...holders(bordersAt(10))]).toEqual([10]);
+  });
+
+  it('none while the borders inside are still too small to draw', () => {
+    expect(bordersAt(8).map((place) => place.id)).toEqual([10, 12]);
+    expect(holders(bordersAt(8)).size).toBe(0);
+  });
+
+  it('none for a holder whose own border is not drawn', () => {
+    expect(holders(bordersAt(10).filter((place) => place.id !== 10)).size).toBe(0);
   });
 });
 
